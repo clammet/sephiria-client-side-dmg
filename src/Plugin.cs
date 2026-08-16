@@ -17,7 +17,7 @@ namespace ClientSideDamage
         // Bumped whenever the wire format of any RPC changes. Host and client must match.
         public const int PROTOCOL_VERSION = 5;
 
-        public static ManualLogSource Log;
+        public static CsdLogger Log;
         public static Harmony HarmonyInstance;
 
         /// <summary>
@@ -60,7 +60,7 @@ namespace ClientSideDamage
 
         private void Awake()
         {
-            Log = Logger;
+            Log = new CsdLogger(Logger);
 
             Enabled = Config.Bind("General", "Enabled", true,
                 "Master switch. When false the mod does nothing (vanilla host-authoritative combat).");
@@ -140,7 +140,11 @@ namespace ClientSideDamage
             // optional: shapes recorded from these callers are anchored to the object running the test
             try { AreaRecorder.PatchKnownCallers(); }
             catch (Exception e) { Log.LogWarning("Area hit caller tracking setup failed (area shapes will stay in world space): " + e); }
+            // optional: the host's status chat line when it creates a lobby
+            try { LobbyCreatedHooks.Install(); }
+            catch (Exception e) { Log.LogWarning("Lobby creation hook failed (host status chat line will not be posted): " + e); }
             Log.LogInfo(NAME + " " + VERSION + " loaded (protocol " + PROTOCOL_VERSION + ")");
+            Diagnostics.HarmonySelfTest();
         }
 
         private void Update()
@@ -149,8 +153,9 @@ namespace ClientSideDamage
             // joining players); everything else needs a fully initialised mod
             try
             {
+                Diagnostics.Tick();
                 ServerSide.Tick();
-                if (Ready) ClientSide.Tick();
+                ClientSide.Tick();   // status lines only while not Ready
             }
             catch (Exception e)
             {
@@ -171,5 +176,24 @@ namespace ClientSideDamage
         {
             if (DebugOn) Log.LogInfo(msg);
         }
+    }
+
+    /// <summary>
+    /// BepInEx's log has no timestamps; every line of ours is prefixed with the wall clock and the
+    /// game's unscaled time (seconds since start) so events can be lined up with what was on screen.
+    /// </summary>
+    public sealed class CsdLogger
+    {
+        private readonly ManualLogSource _log;
+        public CsdLogger(ManualLogSource log) { _log = log; }
+
+        private static string Stamp()
+        {
+            return "[" + DateTime.Now.ToString("HH:mm:ss.fff") + " t=" + Time.unscaledTime.ToString("0.00") + "] ";
+        }
+
+        public void LogInfo(object msg) { _log.LogInfo(Stamp() + msg); }
+        public void LogWarning(object msg) { _log.LogWarning(Stamp() + msg); }
+        public void LogError(object msg) { _log.LogError(Stamp() + msg); }
     }
 }

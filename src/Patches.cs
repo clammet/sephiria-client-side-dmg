@@ -241,6 +241,76 @@ namespace ClientSideDamage
         }
     }
 
+    // ---------------------------------------------------------------- lobby creation (host status chat line)
+
+    /// <summary>
+    /// SteamInvitation.HandleLobbyCreate is what shows "You've created a lobby. You can now invite
+    /// people..." on the host (Steam); UI_MultiplayerPanel_E.HandleCreated is the EOS counterpart.
+    /// The host's status line is posted right there. Installed by hand (not via PatchAll) so a
+    /// rename in a game update only costs the chat line, not the mod.
+    /// </summary>
+    internal static class LobbyCreatedHooks
+    {
+        private const string InviteGuideKey = "UI_Multiplayer_InviteGuide";
+        private static string _inviteGuideText;
+
+        public static void Install()
+        {
+            int n = 0;
+            // 1. the creation handlers themselves
+            HarmonyMethod post = new HarmonyMethod(AccessTools.Method(typeof(LobbyCreatedHooks), nameof(Postfix)));
+            string[][] targets = { new[] { "SteamInvitation", "HandleLobbyCreate" }, new[] { "UI_MultiplayerPanel", "HandleCreated" }, new[] { "UI_MultiplayerPanel_E", "HandleCreated" } };
+            for (int i = 0; i < targets.Length; i++)
+            {
+                Type t = AccessTools.TypeByName(targets[i][0]);
+                System.Reflection.MethodInfo m = t == null ? null : AccessTools.Method(t, targets[i][1]);
+                if (m == null) { Plugin.Log.LogWarning("[CSD] lobby creation hook target " + targets[i][0] + "." + targets[i][1] + " not found"); continue; }
+                Plugin.HarmonyInstance.Patch(m, null, post, null, null, null);
+                Plugin.Log.LogInfo("[CSD] lobby creation hook: " + targets[i][0] + "." + targets[i][1]);
+                n++;
+            }
+            // 2. the system message the player actually sees ("You've created a lobby. You can now invite people...")
+            System.Reflection.MethodInfo open = AccessTools.Method(typeof(UI_SystemMessage), "Open", new Type[] { typeof(string), typeof(float), typeof(bool) });
+            if (open != null)
+            {
+                Plugin.HarmonyInstance.Patch(open, null, new HarmonyMethod(AccessTools.Method(typeof(LobbyCreatedHooks), nameof(SystemMessagePostfix))), null, null, null);
+                Plugin.Log.LogInfo("[CSD] lobby creation hook: UI_SystemMessage.Open (" + InviteGuideKey + ")");
+                n++;
+            }
+            else Plugin.Log.LogWarning("[CSD] lobby creation hook target UI_SystemMessage.Open not found");
+            if (n == 0) Plugin.Log.LogWarning("[CSD] no lobby creation hook found (host status chat line will not be posted)");
+        }
+
+        private static void Postfix(System.Reflection.MethodBase __originalMethod)
+        {
+            try
+            {
+                Plugin.Log.LogInfo("[CSD/host] lobby creation handler ran: " + (__originalMethod != null ? __originalMethod.DeclaringType.Name + "." + __originalMethod.Name : "?"));
+                ServerSide.OnLobbyCreated();
+            }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] lobby status chat failed: " + e); }
+        }
+
+        private static void SystemMessagePostfix(string message)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(message)) return;
+                if (_inviteGuideText == null)
+                {
+                    try { _inviteGuideText = Loc._(InviteGuideKey); } catch { _inviteGuideText = ""; }
+                    if (string.IsNullOrEmpty(_inviteGuideText)) _inviteGuideText = "";
+                }
+                bool match = _inviteGuideText.Length > 0 && message == _inviteGuideText;
+                if (Plugin.DebugOn) Plugin.Debug("[CSD] system message: \"" + message + "\"" + (match ? " (lobby invite guide)" : ""));
+                if (!match) return;
+                Plugin.Log.LogInfo("[CSD/host] lobby invite guide shown");
+                ServerSide.OnLobbyCreated();
+            }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] lobby status chat failed: " + e); }
+        }
+    }
+
     // ---------------------------------------------------------------- lifecycle
 
     [HarmonyPatch(typeof(PlayerAvatar), "OnStartServer")]

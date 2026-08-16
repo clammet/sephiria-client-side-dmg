@@ -37,10 +37,12 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 
 ### 2. Install the plugin
 
-1. Copy `dist\ClientSideDamage.dll` from this folder to
-   `Sephiria\BepInEx\plugins\ClientSideDamage\ClientSideDamage.dll`
-   (any sub-folder of `plugins` works).
-2. Start the game. `BepInEx\LogOutput.log` should contain
+1. Download `ClientSideDamage.dll` from the latest entry on the
+   [**Releases** page](https://github.com/clammet/sephiria-client-side-dmg/releases)
+   (or build it yourself, see *Building* below - the output is `dist\ClientSideDamage.dll`).
+2. Place it at `Sephiria\BepInEx\plugins\ClientSideDamage\ClientSideDamage.dll`
+   (create the `ClientSideDamage` folder; any sub-folder of `plugins` works).
+3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
    [Info   :Client Side Damage] Client Side Damage 1.2.0 loaded (protocol 5)
@@ -53,12 +55,19 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    client: [CSD/client] enabled by host with features: DamageTakenAuthority, BulletHits, MeleeHits, AreaHits
    ```
 
+   The joining player's own game also writes local `CSD : ...` lines into their chat log
+   (`v1.2.0 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   `no answer from the host - it does not seem to run the mod`), so each side can tell from its
+   own screen whether the mod is loaded there.
+
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
-   through the game's own chat RPC, so un-modded players see them too): its own line when the
-   session starts (`CSD : v1.2.0 host ON: guard/dodge, bullets, melee, area, fresh-pos`) and a
-   private line to every joining player once their status is known - `ON for you: ...` with the
-   negotiated features, or `OFF for you: <reason>` (mod not detected on their side, version
-   mismatch, disabled in host / their config, init failure).
+   through the game's own chat RPC, so un-modded players see them too): its own line when it
+   creates a multiplayer lobby (`CSD : v1.2.0 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   and, for every player joining the lobby, a line to everybody in the session as soon as their
+   status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
+   `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
+   `<player>: OFF - <reason>` (mod not detected on their side, version mismatch, disabled in host /
+   their config, init failure).
 
 ### 3. Uninstall
 

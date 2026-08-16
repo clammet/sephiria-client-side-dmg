@@ -97,7 +97,62 @@ namespace ClientSideDamage
         public static void Tick()
         {
             if (!NetworkClient.active && (_hostModded || _bullets.Count > 0 || _melees.Count > 0 || _queries.Count > 0)) Reset();
+            SelfLineTick();
+            if (!Plugin.Ready) return;
             if (_queries.Count > 0) AnswerQueries();
+        }
+
+        // ------------------------------------------------------------------ self status lines (local HUD log only)
+
+        // Written into our own game log (never sent anywhere) so a joining player can tell, from
+        // their own screen, that the mod is loaded on their side and what the host answered.
+        // Posted once the HUD is up and the screen has faded in (a joined player is moved into
+        // the assembly area behind a loading screen right after spawning).
+        private const string ChatName = "CSD";
+        private const float SelfLineSettle = 0.5f;
+        private const float HostSilenceSeconds = 8f;
+        private static readonly List<string> _selfLines = new List<string>();
+        private static float _selfLineNotBefore;
+        private static bool _joinAnnounced;
+        private static float _joinedAt = -1f;
+        private static bool _hostSilenceAnnounced;
+        private static bool _wasClient;
+
+        private static void SelfLine(string msg)
+        {
+            _selfLines.Add(msg);
+            if (_selfLineNotBefore < Time.unscaledTime + SelfLineSettle) _selfLineNotBefore = Time.unscaledTime + SelfLineSettle;
+        }
+
+        private static void SelfLineTick()
+        {
+            bool client = NetworkClient.active && !NetworkServer.active;
+            if (client != _wasClient)
+            {
+                _wasClient = client;
+                _joinAnnounced = false; _hostSilenceAnnounced = false; _joinedAt = -1f; _selfLines.Clear();
+            }
+            if (!client) return;
+            if (!_joinAnnounced && NetworkClient.ready && NetworkClient.localPlayer != null)
+            {
+                _joinAnnounced = true;
+                _joinedAt = Time.unscaledTime;
+                SelfLine("v" + Plugin.VERSION + " loaded on your side" + (Plugin.On ? ", waiting for the host..." : " but disabled: " + (Plugin.Ready ? "General.Enabled = false" : Plugin.DisabledReason)));
+                Plugin.Log.LogInfo("[CSD/client] joined a session (mod " + (Plugin.On ? "on" : "off") + ")");
+            }
+            if (_joinAnnounced && !_hostSilenceAnnounced && !_helloReceived && Plugin.On && Time.unscaledTime - _joinedAt > HostSilenceSeconds)
+            {
+                _hostSilenceAnnounced = true;
+                SelfLine("no answer from the host - it does not seem to run the mod (vanilla combat)");
+                Plugin.Log.LogInfo("[CSD/client] no hello from the host after " + HostSilenceSeconds + " s");
+            }
+            if (_selfLines.Count == 0 || Time.unscaledTime < _selfLineNotBefore) return;
+            ScreenFader fader = ScreenFader.Instance;
+            if (fader != null && fader.IsFading) { _selfLineNotBefore = Time.unscaledTime + SelfLineSettle; return; }
+            GameLogWriter log = GameLogWriter.Instance;
+            if (log == null) return;
+            for (int i = 0; i < _selfLines.Count; i++) log.WriteLog(ChatName + " : " + _selfLines[i], Color.cyan);
+            _selfLines.Clear();
         }
 
         // ------------------------------------------------------------------ handshake
@@ -108,6 +163,8 @@ namespace ClientSideDamage
             if (protocol != Plugin.PROTOCOL_VERSION)
             {
                 Plugin.Log.LogWarning("[CSD/client] host runs protocol " + protocol + " but we run " + Plugin.PROTOCOL_VERSION + " - mod stays off for this session.");
+                _hostSilenceAnnounced = true;
+                SelfLine("mod version mismatch (host protocol " + protocol + ", yours " + Plugin.PROTOCOL_VERSION + ") - update both");
                 return;
             }
             if (avatar == null || !avatar.isOwned) return;
@@ -143,6 +200,18 @@ namespace ClientSideDamage
             PlayerAvatar pa = avatar as PlayerAvatar;
             if (pa != null && pa.isOwned) _localAvatar = pa;
             Plugin.Log.LogInfo("[CSD/client] enabled by host with features: " + features);
+            _hostSilenceAnnounced = true;   // the host answered
+            SelfLine(features != CsdFeatures.None ? "host enabled: " + FeatureList(features) : "host enabled nothing (check both configs)");
+        }
+
+        private static string FeatureList(CsdFeatures f)
+        {
+            string s = "";
+            if ((f & CsdFeatures.DamageTakenAuthority) != 0) s += "guard/dodge, ";
+            if ((f & CsdFeatures.BulletHits) != 0) s += "bullets, ";
+            if ((f & CsdFeatures.MeleeHits) != 0) s += "melee, ";
+            if ((f & CsdFeatures.AreaHits) != 0) s += "area, ";
+            return s.Length > 0 ? s.Substring(0, s.Length - 2) : "none";
         }
 
         public static void OnDamageQuery(UnitAvatar avatar, uint requestId, AreaShape shape)

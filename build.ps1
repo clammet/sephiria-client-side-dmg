@@ -42,7 +42,7 @@ $out = Join-Path $dist "ClientSideDamage.dll"
 
 $refs = @(
     "$managed\mscorlib.dll", "$managed\System.dll", "$managed\System.Core.dll", "$managed\netstandard.dll",
-    "$managed\UnityEngine.dll", "$managed\UnityEngine.CoreModule.dll", "$managed\UnityEngine.Physics2DModule.dll",
+    "$managed\UnityEngine.dll", "$managed\UnityEngine.CoreModule.dll", "$managed\UnityEngine.Physics2DModule.dll", "$managed\UnityEngine.InputLegacyModule.dll",
     "$managed\Assembly-CSharp.dll", "$managed\Mirror.dll", "$managed\Mirror.Components.dll",
     "$BepInExCore\BepInEx.dll", "$BepInExCore\0Harmony.dll"
 )

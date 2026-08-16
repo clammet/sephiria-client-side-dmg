@@ -139,7 +139,7 @@ namespace ClientSideDamage
             ModdedClient mc;
             if (!_clients.TryGetValue(conn.connectionId, out mc))
             {
-                mc = new ModdedClient { conn = conn, avatar = pa, nextHelloTime = Time.time + 1f };
+                mc = new ModdedClient { conn = conn, avatar = pa, nextHelloTime = Time.time };
                 _clients[conn.connectionId] = mc;
                 if (Plugin.DebugOn) Plugin.Debug("[CSD/host] tracking connection " + conn.connectionId);
                 AnnounceIfHostOff(mc);
@@ -150,7 +150,7 @@ namespace ClientSideDamage
                 mc.avatar = pa;
                 mc.acked = false;
                 mc.helloAttempts = 0;
-                mc.nextHelloTime = Time.time + 1f;
+                mc.nextHelloTime = Time.time;
                 mc.announced = false;
                 AnnounceIfHostOff(mc);
             }
@@ -175,19 +175,15 @@ namespace ClientSideDamage
             if (!NetworkServer.active)
             {
                 if (_clients.Count > 0 || _pending.Count > 0) Reset();
-                _hostAnnounced = false;
+                _lobbyPhase = -1;
+                _hostLinePending = false;
                 _chat.Clear();
                 return;
             }
             float now = Time.time;
 
-            // The host's own status line, once per hosted session, as soon as the local client
-            // is in the game (that is also the earliest moment a chat line can be shown).
-            if (!_hostAnnounced && NetworkClient.active && NetworkClient.ready)
-            {
-                _hostAnnounced = true;
-                QueueChat(null, HostStatusLine());
-            }
+            PollLobbyCreated();
+            FlushHostLine();
             FlushChat();
 
             if (now >= _nextScan)
@@ -204,7 +200,7 @@ namespace ClientSideDamage
                 {
                     if (mc.acked || mc.announced || mc.helloAttempts < UnansweredHellosBeforeAnnounce) continue;
                     mc.announced = true;
-                    QueueChat(mc.conn, "OFF for you: mod not detected on your side (host runs v" + Plugin.VERSION + ")");
+                    AnnouncePlayer(mc, "OFF - mod not detected on their side (host runs v" + Plugin.VERSION + ")");
                 }
                 if (_missCooldown.Count > 0)
                 {
@@ -227,7 +223,7 @@ namespace ClientSideDamage
                 if (!Plugin.On || mc.acked || mc.avatar == null || mc.helloAttempts >= 8 || now < mc.nextHelloTime) continue;
                 if (mc.conn == null || !mc.conn.isReady) { mc.nextHelloTime = now + 1f; continue; }
                 mc.helloAttempts++;
-                mc.nextHelloTime = now + 2f;
+                mc.nextHelloTime = now + (mc.helloAttempts < UnansweredHellosBeforeAnnounce ? 1f : 2f);
                 CsdFeatures hf = HostFeatures();
                 CsdRpc.SendToClient(mc.avatar, mc.conn, CsdRpc.Hello, w => { w.WriteInt(Plugin.PROTOCOL_VERSION); w.WriteByte((byte)hf); });
                 if (Plugin.DebugOn) Plugin.Debug("[CSD/host] hello #" + mc.helloAttempts + " -> conn " + mc.conn.connectionId);
@@ -249,7 +245,8 @@ namespace ClientSideDamage
             if (protocol != Plugin.PROTOCOL_VERSION)
             {
                 Plugin.Log.LogWarning("[CSD/host] client " + sender.connectionId + " runs protocol " + protocol + " but we run " + Plugin.PROTOCOL_VERSION + " - mod stays off for that player.");
-                QueueChat(sender, "OFF for you: mod version mismatch (host protocol " + Plugin.PROTOCOL_VERSION + ", yours " + protocol + ") - update both");
+                ModdedClient mm; _clients.TryGetValue(sender.connectionId, out mm);
+                AnnouncePlayer(mm, pa, sender, "OFF - mod version mismatch (host protocol " + Plugin.PROTOCOL_VERSION + ", theirs " + protocol + ") - update both");
                 return;
             }
             ModdedClient mc = Track(sender, pa);
@@ -267,21 +264,22 @@ namespace ClientSideDamage
             Plugin.Log.LogInfo("[CSD/host] client " + mc.conn.connectionId + " enabled with features: " + f);
             RefreshAreaTargets();
             mc.announced = true;
-            if (f != CsdFeatures.None) QueueChat(mc.conn, "ON for you: " + FeatureList(f));
-            else if (!Plugin.On || HostFeatures() == CsdFeatures.None) QueueChat(mc.conn, "OFF for you: " + HostOffReason());
-            else if (mc.requested == CsdFeatures.None) QueueChat(mc.conn, "OFF for you: disabled in your config");
-            else QueueChat(mc.conn, "OFF for you: no feature enabled on both sides (host: " + FeatureList(HostFeatures()) + ")");
+            if (f != CsdFeatures.None) AnnouncePlayer(mc, "ON: " + FeatureList(f));
+            else if (!Plugin.On || HostFeatures() == CsdFeatures.None) AnnouncePlayer(mc, "OFF - " + HostOffReason());
+            else if (mc.requested == CsdFeatures.None) AnnouncePlayer(mc, "OFF - disabled in their config");
+            else AnnouncePlayer(mc, "OFF - no feature enabled on both sides (host: " + FeatureList(HostFeatures()) + ")");
         }
 
         // ------------------------------------------------------------------ status chat
 
         // Status lines ride on the game's own chat RPC (DungeonManager.RpcChat: "name : message"
-        // in the game log, 120 chars max), so an un-modded client sees them too. Lines for one
-        // player go out as a TargetRpc with that RPC's hash; the host's own line (and any fallback)
-        // is a normal broadcast through DungeonManager.Chat.
+        // in the game log, 120 chars max), so un-modded clients see them too. A joining player's
+        // status is broadcast to everybody in the session ("<player>: ON: ..."); the host's own
+        // line goes into its local log at lobby creation. (SendChat can still address a single
+        // connection - kept for the fallback path.)
         private const string ChatName = "CSD";
         private const string RpcChatFullName = "System.Void DungeonManager::RpcChat(PlayerAvatar,System.String,System.String)";
-        private const int UnansweredHellosBeforeAnnounce = 3;   // ~5 s after the player is in
+        private const int UnansweredHellosBeforeAnnounce = 3;   // hellos at 0 / 1 / 2 s: an un-modded client is announced ~2 s after joining
 
         private struct ChatItem
         {
@@ -289,7 +287,60 @@ namespace ClientSideDamage
             public string msg;
         }
         private static readonly List<ChatItem> _chat = new List<ChatItem>();
-        private static bool _hostAnnounced;
+        private static int _lobbyPhase = -1;
+
+        /// <summary>
+        /// The host created a multiplayer lobby (the moment the game shows "You've created a lobby.
+        /// You can now invite people...", see LobbyCreatedHooks): post the host's own status line.
+        /// Creating the lobby also moves the host to the assembly area behind a fade / loading
+        /// screen, and HUD log lines fade out within seconds - so the line is written into the local
+        /// game log (the same call the chat RPC makes on arrival) once the screen has faded back in.
+        /// (Nobody else is in the session yet; joining players get their own line.)
+        /// </summary>
+        public static void OnLobbyCreated()
+        {
+            // several triggers can fire for one creation (creation handler, system message, phase poll): one line
+            if (_hostLinePending || Time.unscaledTime - _hostLineArmedAt < 5f) return;
+            _hostLineArmedAt = Time.unscaledTime;
+            Plugin.Log.LogInfo("[CSD/host] lobby created: " + HostStatusLine());
+            _hostLinePending = true;
+            _hostLineNotBefore = Time.unscaledTime + HostLineSettle;
+        }
+        private static float _hostLineArmedAt = -100f;
+
+        private const float HostLineSettle = 0.5f;   // after the fade-in, so the line is not lost under the loading screen
+        private static bool _hostLinePending;
+        private static float _hostLineNotBefore;
+
+        private static void FlushHostLine()
+        {
+            if (!_hostLinePending || Time.unscaledTime < _hostLineNotBefore) return;
+            ScreenFader fader = ScreenFader.Instance;
+            if (fader != null && fader.IsFading) { _hostLineNotBefore = Time.unscaledTime + HostLineSettle; return; }
+            GameLogWriter log = GameLogWriter.Instance;
+            if (log == null) return;   // no HUD log yet: keep waiting
+            _hostLinePending = false;
+            string line = HostStatusLine();
+            log.WriteLog(ChatName + " : " + line, Color.cyan);
+            Plugin.Log.LogInfo("[CSD/host] posted host status line: " + line + " (fader " + (fader != null ? fader.FadingState.ToString() : "none") + ")");
+        }
+
+        /// <summary>
+        /// Patch-free trigger (also the only one when the mod is not Ready): the Steam panel flips
+        /// DungeonManager.lobbyCreatedPhase to 1 on creation. OnLobbyCreated dedupes.
+        /// </summary>
+        private static void PollLobbyCreated()
+        {
+            DungeonManager dm = DungeonManager.Instance;
+            if (dm == null) return;
+            int phase = dm.lobbyCreatedPhase;
+            if (phase == 1 && _lobbyPhase != -1 && _lobbyPhase != 1)
+            {
+                Plugin.Log.LogInfo("[CSD/host] DungeonManager.lobbyCreatedPhase -> 1");
+                OnLobbyCreated();
+            }
+            _lobbyPhase = phase;
+        }
 
         private static string FeatureList(CsdFeatures f)
         {
@@ -325,7 +376,22 @@ namespace ClientSideDamage
         {
             if (Plugin.On && HostFeatures() != CsdFeatures.None) return;   // handshake will announce
             mc.announced = true;
-            QueueChat(mc.conn, "OFF for you: " + HostOffReason());
+            AnnouncePlayer(mc, "OFF - " + HostOffReason());
+        }
+
+        /// <summary>Broadcasts a joining player's mod status to everyone: "<name>: ON: ..." / "<name>: OFF - reason".</summary>
+        private static void AnnouncePlayer(ModdedClient mc, string status)
+        {
+            AnnouncePlayer(mc, mc != null ? mc.avatar : null, mc != null ? mc.conn : null, status);
+        }
+
+        private static void AnnouncePlayer(ModdedClient mc, PlayerAvatar pa, NetworkConnectionToClient conn, string status)
+        {
+            if (pa == null && mc != null) pa = mc.avatar;
+            string name = null;
+            try { if (pa != null) name = pa.Name; } catch { }
+            if (string.IsNullOrEmpty(name)) name = conn != null ? "player " + conn.connectionId : "player";
+            QueueChat(null, name + ": " + status);
         }
 
         private static void QueueChat(NetworkConnectionToClient conn, string msg)
