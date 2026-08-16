@@ -1,0 +1,1 @@
+One thing to watch in testing: the new caller-level parking means a host-detected bullet vs. a modded player is not consumed until the reply arrives (≈RTT); if it hits a wall in that window the replay sees it destroyed and the hit is lost — the same trade-off flow B already had.

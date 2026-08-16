@@ -1,0 +1,31 @@
+# .NET / MSBuild build output (dist/ is published as a GitHub release, not tracked)
+bin/
+obj/
+*.pdb
+dist/
+
+# NuGet / restore
+*.nupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local game / tools folders sometimes placed next to the repo
+Sephiria/
+tools/
