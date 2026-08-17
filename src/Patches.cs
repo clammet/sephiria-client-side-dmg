@@ -116,11 +116,31 @@ namespace ClientSideDamage
     [HarmonyPatch(typeof(Bullet), "Update")]
     internal static class Patch_Bullet_Update
     {
+        // host: speed tracking, and a parked bullet skips its vanilla update entirely (see ServerSide.TryParkBulletDestroy)
+        private static bool Prefix(Bullet __instance)
+        {
+            if (!NetworkServer.active) return true;
+            try { return !ServerSide.OnBulletUpdateHost(__instance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet update hook failed: " + e); return true; }
+        }
+
         private static void Postfix(Bullet __instance)
         {
             if (NetworkServer.active) return;
             try { ClientSide.OnBulletUpdate(__instance); }
             catch (Exception e) { Plugin.Log.LogError("[CSD/client] bullet detection failed: " + e); }
+        }
+    }
+
+    // a bullet that wants to destroy itself while a client's hit report may still be on its way is parked instead
+    [HarmonyPatch(typeof(Bullet), "DestroySelf")]
+    internal static class Patch_Bullet_DestroySelf
+    {
+        private static bool Prefix(Bullet __instance, bool forceDestroy)
+        {
+            if (!NetworkServer.active || !Plugin.On) return true;
+            try { return !ServerSide.TryParkBulletDestroy(__instance, forceDestroy); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet park check failed: " + e); return true; }
         }
     }
 
@@ -178,7 +198,11 @@ namespace ClientSideDamage
     [HarmonyPatch(typeof(Bullet), "OnDespawn")]
     internal static class Patch_Bullet_OnDespawn
     {
-        private static void Postfix(Bullet __instance) { ClientSide.OnBulletGone(__instance); }
+        private static void Postfix(Bullet __instance)
+        {
+            ClientSide.OnBulletGone(__instance);
+            if (NetworkServer.active) ServerSide.OnBulletGoneHost(__instance);
+        }
     }
 
     // host -> modded clients: swing parameters for the client side shape test (see ServerSide.SendMeleeSpawn)

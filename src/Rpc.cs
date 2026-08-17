@@ -261,11 +261,12 @@ namespace ClientSideDamage
                 byte victimComponent = reader.ReadByte();
                 byte kind = reader.ReadByte();
                 Vector2 direction = reader.ReadVector2();
+                Vector2 bulletPos = reader.ReadVector2();
                 bool hasSnapshot = reader.ReadBool();
                 CombatSnapshot snap = default(CombatSnapshot);
                 if (hasSnapshot) snap = CombatSnapshot.Read(reader);
                 if (!Plugin.Ready || !NetworkServer.active) return;
-                ServerSide.OnBulletHit(obj as UnitAvatar, sender, bulletNetId, victimNetId, victimComponent, kind, direction, hasSnapshot, snap);
+                ServerSide.OnBulletHit(obj as UnitAvatar, sender, bulletNetId, victimNetId, victimComponent, kind, direction, bulletPos, hasSnapshot, snap);
             });
         }
 

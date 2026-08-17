@@ -62,6 +62,7 @@ namespace ClientSideDamage
             public Vector3 hitPoint;
             public Transform hitT;
             public long pairKey;       // Bullet / Melee: (projectile netId, victim netId)
+            public Vector3 bulletPos;  // Bullet: where the bullet was when the hit was detected (the replay rewinds it there)
             public uint projectileNetId;  // Bullet / Melee: pooled objects may be re-used before the reply
         }
 
@@ -84,6 +85,8 @@ namespace ClientSideDamage
         [ThreadStatic] public static bool ApplyDamageBypass;
         /// <summary>Set while we call back into vanilla Bullet.AttackOnServer / MeleeCollision.Attack.</summary>
         [ThreadStatic] public static bool ProjectileBypass;
+        /// <summary>Set while a Bullet.DestroySelf must run vanilla-style (releasing a parked bullet, or a reported hit consuming it).</summary>
+        [ThreadStatic] public static bool BulletDestroyBypass;
 
         // Optimistic value returned to a caller that parks its damage inside ApplyDamage (flow A
         // callers other than Bullet / MeleeCollision, which are parked and replayed whole). The
@@ -113,6 +116,8 @@ namespace ClientSideDamage
             _pendingPairs.Clear();
             _missCooldown.Clear();
             _lingering.Clear();
+            _parked.Clear();
+            _motion.Clear();
             AreaRecorder.Clear();
         }
 
@@ -236,6 +241,7 @@ namespace ClientSideDamage
                 DrainPending(p => now - p.createdAt > timeout, true, "timed out");
             }
             if (_lingering.Count > 0) TickLingeringMelee(now);
+            if (_parked.Count > 0 || _motion.Count > 0) TickParkedBullets(now);
         }
 
         // ------------------------------------------------------------------ flow C: client-owned swings outlive their duration until the reports are in
@@ -257,7 +263,7 @@ namespace ClientSideDamage
         }
         private static readonly List<LingeringMelee> _lingering = new List<LingeringMelee>();
 
-        private static float MeleeGrace(ModdedClient mc)
+        private static float ReportGrace(ModdedClient mc)
         {
             double rtt = mc != null && mc.conn != null ? mc.conn.rtt : 0.0;
             // two round trips (reports of the swing's last frames leave one duration after the first) plus jitter
@@ -276,7 +282,7 @@ namespace ClientSideDamage
                 if (!ReferenceEquals(_lingering[i].melee, m)) continue;
                 return Time.time < _lingering[i].destroyAt;   // durationTimer fired again while lingering
             }
-            float grace = MeleeGrace(mc);
+            float grace = ReportGrace(mc);
             _lingering.Add(new LingeringMelee { melee = m, destroyAt = Time.time + grace });
             if (Plugin.DebugOn) Plugin.Debug("[CSD/host] melee " + m.name + " (netId " + m.netId + ") of conn " + mc.conn.connectionId + " lingers " + grace.ToString("0.00") + "s for late reports (rtt " + (mc.conn.rtt * 1000.0).ToString("0") + " ms)");
             return true;
@@ -292,6 +298,203 @@ namespace ClientSideDamage
                 _lingering.RemoveAt(i);
                 try { l.melee.DestroySelf(true); }
                 catch (Exception e) { Plugin.Log.LogError("[CSD/host] destroying lingering swing failed: " + e); }
+            }
+        }
+
+        // ------------------------------------------------------------------ flow B: bullets parked at their point of destruction while a report may be in flight
+
+        /// <summary>
+        /// The bullet twin of the melee linger. A bullet a modded client hit-tests (its own bullet
+        /// against enemies, or a hostile bullet against itself) keeps flying on the host while the
+        /// client's report travels back; when the host destroys it in that window - a wall right
+        /// behind the target, the lifetime timer running out - the report finds nothing and the
+        /// hit is lost (and a fast fireball would explode at the wall *behind* a player who blocked
+        /// it in front). So when such a bullet asks to destroy itself normally while somebody who
+        /// might have reported it is within reach (its speed times the round trip), it is parked:
+        /// frozen where it is (its Update is skipped, so no movement, collision or timers), clients
+        /// are told its collision is off (nobody keeps testing the frozen bullet), and it is
+        /// destroyed vanilla-style once the grace period passed without a report. A report that
+        /// arrives meanwhile is applied with the bullet rewound to the reported contact point (see
+        /// OnBulletHit), so a hit that consumes it explodes there, from the front, exactly like a
+        /// vanilla hit. Bullets driven by a TopdownRigidbody (lobbed / physical projectiles) and
+        /// bullets that never die on contact (bounce) are not parked.
+        /// </summary>
+        private sealed class ParkedBullet
+        {
+            public Bullet bullet;
+            public float releaseAt;
+            public Vector3 pos;
+        }
+        private struct BulletMotion
+        {
+            public Vector3 lastPos;
+            public float speed;    // units per second, smoothed
+            public bool hasLast;
+        }
+        private static readonly List<ParkedBullet> _parked = new List<ParkedBullet>();
+        private static readonly Dictionary<Bullet, BulletMotion> _motion = new Dictionary<Bullet, BulletMotion>();
+        private static readonly Collider2D[] _parkScratch = new Collider2D[24];
+        private static readonly List<Bullet> _motionTmp = new List<Bullet>();
+        private static float _nextMotionSweep;
+
+        public static bool IsParked(Bullet b)
+        {
+            for (int i = 0; i < _parked.Count; i++) if (ReferenceEquals(_parked[i].bullet, b)) return true;
+            return false;
+        }
+
+        /// <summary>Bullet.Update prefix on the host. Returns true when the vanilla update must be skipped (parked bullet).</summary>
+        public static bool OnBulletUpdateHost(Bullet b)
+        {
+            if (b == null || !Plugin.On) return false;
+            if (_parked.Count > 0 && IsParked(b)) return true;
+            if (_clients.Count == 0 || !b.isServer) return false;
+            // speed estimate for the park radius (only while modded clients are connected)
+            BulletMotion m;
+            Vector3 p = b.transform.position;
+            if (_motion.TryGetValue(b, out m) && m.hasLast)
+            {
+                float dt = Time.deltaTime;
+                if (dt > 0f)
+                {
+                    float v = (p - m.lastPos).magnitude / dt;
+                    m.speed = m.speed <= 0f ? v : m.speed * 0.7f + v * 0.3f;
+                }
+            }
+            m.lastPos = p; m.hasLast = true;
+            _motion[b] = m;
+            return false;
+        }
+
+        public static void OnBulletGoneHost(Bullet b)
+        {
+            if (b == null) return;
+            _motion.Remove(b);
+            for (int i = _parked.Count - 1; i >= 0; i--) if (ReferenceEquals(_parked[i].bullet, b)) _parked.RemoveAt(i);
+        }
+
+        /// <summary>Bullet.DestroySelf prefix: true = keep the bullet parked for now (destroyed from Tick unless a report consumes it).</summary>
+        public static bool TryParkBulletDestroy(Bullet b, bool forceDestroy)
+        {
+            if (forceDestroy || BulletDestroyBypass || b == null || !NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value) return false;
+            if (!b.isServer || b.netId == 0 || _clients.Count == 0) return false;
+            if (b.DestroyModule == null || b.DestroyModule.IsDestroyed) return false;
+            if (IsParked(b)) return true;
+            if (CsdUtil.IsBulletExcluded(b)) return false;
+            if (b.MoveModule != null && b.MoveModule.TopdownRigidbody != null) return false;   // rigidbody driven: cannot be frozen cleanly
+            float grace;
+            string why;
+            if (!ShouldParkBullet(b, out grace, out why)) return false;
+            ParkedBullet pb = new ParkedBullet { bullet = b, releaseAt = Time.time + grace, pos = b.transform.position };
+            _parked.Add(pb);
+            // clients stop testing the frozen bullet (reports already on the wire still count: the host side flag stays as it is)
+            SyncBulletCollisionState(b, false);
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] bullet " + b.name + " (netId " + b.netId + ") parked " + grace.ToString("0.00") + "s at " + (Vector2)pb.pos + ": " + why);
+            return true;
+        }
+
+        private static bool ShouldParkBullet(Bullet b, out float grace, out string why)
+        {
+            grace = 0f; why = null;
+            // a host-detected hit against a modded player is parked and waiting for the reply: keep the bullet for the replay
+            foreach (PendingDamage p in _pending.Values)
+            {
+                if (p.kind == PendingKind.Bullet && ReferenceEquals(p.bullet, b))
+                {
+                    grace = Mathf.Max(grace, ReportGrace(p.client));
+                    why = "pending damage query";
+                }
+            }
+            bool isRay = b.MoveModule is BulletMoveModule_RaycastArrow;
+            if (!isRay && (!b.isCollisionEnabled || b.collosionType == Bullet.ECollisionTiming.None)) return why != null;
+            BulletMotion m;
+            _motion.TryGetValue(b, out m);
+            Vector2 pos = b.transform.position;
+            ModdedClient owner = GetModdedClient(b.NetworkOwner);
+            if (owner != null && (owner.features & CsdFeatures.BulletHits) != 0)
+            {
+                // the client's own bullet: is there anything it could have hit within reach?
+                float reach = ParkReach(m.speed, owner, isRay ? RayReach(b) : 0f);
+                ContactFilter2D f = R.BulletContactFilter(b);
+                int n;
+                AreaRecorder.Suppress = true;
+                try { n = Physics2D.OverlapCircle(pos, reach, f, _parkScratch); }
+                finally { AreaRecorder.Suppress = false; }
+                for (int i = 0; i < n; i++)
+                {
+                    Collider2D c = _parkScratch[i];
+                    if (c == null) continue;
+                    CombatBehaviour cb = CsdUtil.CombatBehaviourFromCollider(c);
+                    if (cb == null || cb == b.NetworkOwner || !CsdUtil.BulletCanHurt(b, cb)) continue;
+                    if (b.attackedList != null)
+                    {
+                        bool done = false;
+                        for (int j = 0; j < b.attackedList.Count; j++) if (b.attackedList[j].combatBehaviour == cb) { done = true; break; }
+                        if (done) continue;
+                    }
+                    grace = Mathf.Max(grace, ReportGrace(owner));
+                    why = "own bullet, " + cb.name + " within " + reach.ToString("0.0") + "u";
+                    break;
+                }
+            }
+            else
+            {
+                // somebody else's bullet: is a modded player it could hurt within reach?
+                foreach (ModdedClient mc in _clients.Values)
+                {
+                    if (!mc.acked || (mc.features & CsdFeatures.BulletHits) == 0 || mc.avatar == null) continue;
+                    if (mc.avatar.IsDead || !CsdUtil.BulletCanHurt(b, mc.avatar)) continue;
+                    float reach = ParkReach(m.speed, mc, isRay ? RayReach(b) : 0f);
+                    if (((Vector2)mc.avatar.transform.position - pos).sqrMagnitude > reach * reach) continue;
+                    grace = Mathf.Max(grace, ReportGrace(mc));
+                    why = "hostile bullet, " + mc.avatar.name + " within " + reach.ToString("0.0") + "u";
+                    break;
+                }
+            }
+            return why != null;
+        }
+
+        /// <summary>How far the bullet may have travelled since a client saw a contact with it: speed x (round trip + margin), plus hitbox sizes.</summary>
+        private static float ParkReach(float speed, ModdedClient mc, float extra)
+        {
+            double rtt = mc != null && mc.conn != null ? mc.conn.rtt : 0.15;
+            float t = (float)rtt * 1.5f + 0.1f;
+            return Mathf.Clamp(speed * t, 0.5f, 12f) + 1f + extra;
+        }
+
+        private static float RayReach(Bullet b)
+        {
+            BulletMoveModule_RaycastArrow ra = b.MoveModule as BulletMoveModule_RaycastArrow;
+            if (ra == null || ra.Bullet == null) return 0f;
+            Vector2 span = (Vector2)ra.EndPosition - (Vector2)ra.BeginPosition;
+            return Mathf.Min(span.magnitude, 30f);
+        }
+
+        private static void TickParkedBullets(float now)
+        {
+            for (int i = _parked.Count - 1; i >= 0; i--)
+            {
+                ParkedBullet pb = _parked[i];
+                if (pb.bullet == null) { _parked.RemoveAt(i); continue; }
+                Bullet b = pb.bullet;
+                if (b.DestroyModule != null && b.DestroyModule.IsDestroyed) { _parked.RemoveAt(i); continue; }   // consumed by a report meanwhile
+                if (now < pb.releaseAt) continue;
+                _parked.RemoveAt(i);
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] bullet " + b.name + " (netId " + b.netId + ") released: no report, destroyed where it was parked");
+                bool prev = BulletDestroyBypass;
+                BulletDestroyBypass = true;
+                try { b.DestroySelf(false); }
+                catch (Exception e) { Plugin.Log.LogError("[CSD/host] destroying parked bullet failed: " + e); }
+                finally { BulletDestroyBypass = prev; }
+            }
+            // forget motion records of bullets that are gone (cheap periodic sweep; OnDespawn handles the normal case)
+            if (now >= _nextMotionSweep)
+            {
+                _nextMotionSweep = now + 5f;
+                _motionTmp.Clear();
+                foreach (Bullet k in _motion.Keys) if (k == null) _motionTmp.Add(k);
+                for (int i = 0; i < _motionTmp.Count; i++) _motion.Remove(_motionTmp[i]);
+                _motionTmp.Clear();
             }
         }
 
@@ -419,7 +622,7 @@ namespace ClientSideDamage
             return "all host features off in config";
         }
 
-        /// <summary>The host's own one-liner, e.g. "v1.2.3 host ON: guard/dodge, bullets, melee, area, fresh-pos".</summary>
+        /// <summary>The host's own one-liner, e.g. "v1.3.0 host ON: guard/dodge, bullets, melee, area, fresh-pos".</summary>
         public static string HostStatusLine()
         {
             CsdFeatures f = HostFeatures();
@@ -731,7 +934,7 @@ namespace ClientSideDamage
             }
 
             PendingDamage p = NewPending(PendingKind.Bullet, pa, mc, useSnapshot, shape);
-            p.bullet = b; p.hitT = hit; p.direction = dir; p.pairKey = key; p.projectileNetId = b.netId;
+            p.bullet = b; p.hitT = hit; p.direction = dir; p.pairKey = key; p.projectileNetId = b.netId; p.bulletPos = b.transform.position;
             _pendingPairs.Add(key);
             if (Plugin.DebugOn)
                 Plugin.Debug("[CSD/host] bullet query " + p.id + " " + b.name + " -> " + pa.name + (shape != null ? " shape: " + shape : " (no shape)"));
@@ -806,7 +1009,12 @@ namespace ClientSideDamage
                     if (b.DestroyModule == null || b.DestroyModule.IsDestroyed) return;
                     Bullet bb = b; Transform ht = p.hitT; Vector2 dir = p.direction; PlayerAvatar victim = p.victim;
                     byte code;
-                    bool wasHit = RunProjectile(victim, force, snap, () => BulletAttack(bb, victim, ht, dir, out code));
+                    // rewind to where the bullet was when the host detected the hit (see OnBulletHit)
+                    Vector3 savedPos = b.transform.position;
+                    b.transform.position = new Vector3(p.bulletPos.x, p.bulletPos.y, savedPos.z);
+                    bool wasHit;
+                    try { wasHit = RunProjectile(victim, force, snap, () => BulletAttack(bb, victim, ht, dir, out code)); }
+                    finally { if (b != null && b.DestroyModule != null && !b.DestroyModule.IsDestroyed) b.transform.position = savedPos; }
                     ApplyBulletPhase(b, wasHit);
                     break;
                 }
@@ -851,8 +1059,9 @@ namespace ClientSideDamage
         /// </summary>
         private static bool RunProjectile(PlayerAvatar victim, bool force, CombatSnapshot snap, Func<bool> body)
         {
-            bool prevProj = ProjectileBypass;
+            bool prevProj = ProjectileBypass, prevDestroy = BulletDestroyBypass;
             ProjectileBypass = true;
+            BulletDestroyBypass = true;   // a hit consuming the bullet destroys it vanilla-style, it is never parked again
             try
             {
                 if (!force) return body();
@@ -865,7 +1074,7 @@ namespace ClientSideDamage
                 }
             }
             catch (Exception e) { Plugin.Log.LogError("[CSD/host] projectile hit failed: " + e); return false; }
-            finally { ProjectileBypass = prevProj; }
+            finally { ProjectileBypass = prevProj; BulletDestroyBypass = prevDestroy; }
         }
 
         /// <summary>
@@ -999,10 +1208,16 @@ namespace ClientSideDamage
         /// </summary>
         public static void SyncBulletCollisionState(Bullet b)
         {
+            if (b == null) return;
+            // a parked bullet stays "collision off" for the clients whatever the host toggles
+            SyncBulletCollisionState(b, b.isCollisionEnabled && !IsParked(b));
+        }
+
+        public static void SyncBulletCollisionState(Bullet b, bool enabled)
+        {
             if (b == null || !NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value) return;
             if (!b.isServer || b.netId == 0) return;
             if (_clients.Count == 0) return;
-            bool enabled = b.isCollisionEnabled;
             Action<NetworkWriter> payload = w => w.WriteBool(enabled);
             foreach (ModdedClient mc in _clients.Values)
             {
@@ -1064,7 +1279,7 @@ namespace ClientSideDamage
                     + " client-owned=" + IsClientAuthoritative(m.owner, CsdFeatures.MeleeHits) + " -> " + sent + " client(s)");
         }
 
-        public static void OnBulletHit(UnitAvatar avatar, NetworkConnectionToClient sender, uint bulletNetId, uint victimNetId, byte victimComponent, byte kind, Vector2 direction, bool hasSnapshot, CombatSnapshot snap)
+        public static void OnBulletHit(UnitAvatar avatar, NetworkConnectionToClient sender, uint bulletNetId, uint victimNetId, byte victimComponent, byte kind, Vector2 direction, Vector2 bulletPos, bool hasSnapshot, CombatSnapshot snap)
         {
             PlayerAvatar me = avatar as PlayerAvatar;
             ModdedClient mc = GetModdedClient(me);
@@ -1075,7 +1290,11 @@ namespace ClientSideDamage
             try
             {
                 Bullet b = CsdUtil.FindComponent<Bullet>(NetworkServer.spawned, bulletNetId);
-                if (b == null || !b.isServer) return;
+                if (b == null || !b.isServer)
+                {
+                    if (Plugin.DebugOn) Plugin.Debug("[CSD/host] bullet report from conn " + sender.connectionId + " (bullet " + bulletNetId + " -> " + victimNetId + "/" + victimComponent + ") dropped: bullet not spawned (already gone)");
+                    return;
+                }
                 if (CsdUtil.IsBulletExcluded(b)) return;
                 CombatBehaviour victim = CsdUtil.FindBehaviour(NetworkServer.spawned, victimNetId, victimComponent) as CombatBehaviour;
                 if (victim == null) return;
@@ -1094,11 +1313,30 @@ namespace ClientSideDamage
                 Transform hitT = CsdUtil.FindHitboxTransform(victim);
                 if (hitT == null) return;
 
+                // Rewind: the host's copy of the bullet has travelled one round trip past the point
+                // where the client saw the contact. Apply the hit with the bullet at that point, so
+                // everything vanilla derives from the bullet position - hit FX placement, and above
+                // all a destroy-on-hit explosion (centred on the victim, from the front, blockable
+                // like vanilla's) - lands where the client saw it. If the bullet survives (pierce,
+                // dodge, pass) it goes back to where it was in the same frame, so nothing jumps.
+                Vector3 savedPos = b.transform.position;
+                bool rewound = false;
+                if (!isRay && !float.IsNaN(bulletPos.x) && !float.IsNaN(bulletPos.y))
+                {
+                    b.transform.position = new Vector3(bulletPos.x, bulletPos.y, savedPos.z);
+                    rewound = true;
+                }
                 bool force = victimIsMe && hasSnapshot && (mc.features & CsdFeatures.DamageTakenAuthority) != 0;
                 byte c = CsdRpc.HitResult_NotApplied;
-                bool hit = RunProjectile(me, force, snap, () => BulletAttack(b, victim, hitT, direction, out c));
+                bool hit;
+                try { hit = RunProjectile(me, force, snap, () => BulletAttack(b, victim, hitT, direction, out c)); }
+                finally
+                {
+                    if (rewound && b != null && b.DestroyModule != null && !b.DestroyModule.IsDestroyed) b.transform.position = savedPos;
+                }
                 code = c;
-                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] bullet " + b.name + " -> " + victim.name + " reported by conn " + sender.connectionId + " hit=" + hit + " code=" + code);
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] bullet " + b.name + " -> " + victim.name + " reported by conn " + sender.connectionId + " hit=" + hit + " code=" + code
+                    + (rewound ? " rewound " + ((Vector2)savedPos - bulletPos).magnitude.ToString("0.00") + "u" : "") + (IsParked(b) ? " (parked)" : ""));
                 if (!isRay) ApplyBulletPhase(b, hit);
             }
             finally

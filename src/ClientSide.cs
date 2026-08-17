@@ -572,6 +572,8 @@ namespace ClientSideDamage
             uint bulletNetId = b.netId;
             uint victimNetId = cb.netId;
             byte victimComponent = (byte)cb.ComponentIndex;
+            // where we see the bullet at the moment of contact: the host rewinds its copy there before applying
+            Vector2 bulletPos = b.transform.position;
             CombatSnapshot snap = victimIsMe ? Capture(me) : default(CombatSnapshot);
             CsdRpc.SendToServer(me, CsdRpc.BulletHit, w =>
             {
@@ -580,6 +582,7 @@ namespace ClientSideDamage
                 w.WriteByte(victimComponent);
                 w.WriteByte(kind);
                 w.WriteVector2(dir);
+                w.WriteVector2(bulletPos);
                 w.WriteBool(victimIsMe);
                 if (victimIsMe) snap.Write(w);
             });

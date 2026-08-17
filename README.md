@@ -47,7 +47,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.2.3 loaded (protocol 6)
+   [Info   :Client Side Damage] Client Side Damage 1.3.0 loaded (protocol 7)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +58,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.2.3 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.3.0 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.2.3 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.3.0 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -149,6 +149,22 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   are re-cast by the client from the angle/length the host sends for the sprite (`RpcSetSprite`)
   and reported the same way. Bullets whose hit volume exists only on the host (the growing
   `WaveWithParticle` / `RingWave` colliders) stay host-side on both ends (`CsdUtil.IsBulletExcluded`).
+  Two things compensate for the round trip a report needs while the host's copy of the bullet
+  keeps flying: **rewind** - the report carries the bullet position the client saw at contact,
+  and the host moves its bullet there before applying the hit, so hit FX and above all a
+  destroy-on-hit explosion happen where the client saw the contact (centred on the victim, from
+  the front, blockable like vanilla's) instead of speed × RTT further along; a bullet that survives
+  the hit (pierce, dodge) is put back in the same frame. And **parking** - a bullet that wants to
+  destroy itself normally (wall, lifetime) while somebody who might have reported it is within
+  reach (its speed × the round trip: an enemy hitbox for a client-owned bullet, the client's own
+  player for a hostile one) is frozen where it is instead (its `Update` is skipped; clients are
+  told its collision is off so nobody keeps testing the frozen bullet). A report arriving within
+  the grace (2×RTT + 0.15 s, 0.3–2 s) is applied with the rewind above; without one the bullet is
+  destroyed vanilla-style where it was parked, just late. Bullets driven by a `TopdownRigidbody`
+  (lobbed / physical projectiles) and bullets that do not die on contact (bounce, boomerang, hover)
+  are never parked; `forceDestroy` (a swing cutting a bullet, owner death, floor change) never is.
+  Visible cost: a near-miss bullet rests on the wall for up to the grace before it explodes; a hit
+  one visibly jumps back from the wall to the victim to explode there.
 
 * **Melee** (`MeleeCollision`): swings are network-spawned objects with the same shape data on
   both sides and a `NetworkTransformReliable`. Right after the spawn the host sends modded clients
@@ -229,9 +245,10 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   target that has since died or been revived (revive grants invulnerability) is rejected.
 * Late hit reports for projectiles the host already destroyed are dropped (netIds are never
   reused in a session; the host logs `melee report ... dropped: swing netId N not spawned` with
-  `DebugLog` on). Client-owned swings linger for the grace period described above so this only
-  affects them under extreme lag; bullets are not lingered (a bullet that has hit a wall or expired
-  before the report arrives is gone). Late damage replies after the timeout are dropped (no double apply).
+  `DebugLog` on). Client-owned swings linger and near-miss bullets are parked for the grace
+  period described above, so this only affects them under extreme lag, for rigidbody-driven
+  bullets, or when the reporter was outside the park reach (host: `bullet report ... dropped:
+  bullet not spawned`). Late damage replies after the timeout are dropped (no double apply).
 * Floor moves (`DungeonManager.LocalMoveFloor`) and scene changes drop parked damage queries for
   the moving player, so nothing from the previous floor lands after the teleport.
 * All mod traffic uses Mirror's reliable channel: packet loss only delays, it never loses a hit
