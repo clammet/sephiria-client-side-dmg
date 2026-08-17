@@ -121,6 +121,36 @@ namespace ClientSideDamage
             return true;
         }
 
+        /// <summary>Vanilla's "already attacked" test (Bullet.attackedList) as AttackOnServer performs it.</summary>
+        public static bool BulletAlreadyAttacked(Bullet b, CombatBehaviour cb)
+        {
+            List<Bullet.Attacked> list = b != null ? b.attackedList : null;
+            if (list == null) return false;
+            for (int i = 0; i < list.Count; i++) if (list[i].combatBehaviour == cb) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// The hit direction as vanilla Bullet.AttackOnServer computes it, from the bullet position
+        /// and the moving direction the caller has (CurMovingDirection on the host, the observed
+        /// displacement on the client, whose fallback is the point direction).
+        /// </summary>
+        /// <paramref name="pointFallback"/>: use the point direction when the moving direction is
+        /// unknown (near zero). The host passes CurMovingDirection straight through like vanilla (a
+        /// zero direction means "guard from any facing" in ApplyDamage); the client only knows the
+        /// observed displacement, which is zero for one frame after spawn.
+        public static Vector2 VanillaHitDirection(Bullet b, Vector3 bulletPos, Vector3 hitPos, Vector2 movingDir, bool pointFallback)
+        {
+            Vector2 point = hitPos - bulletPos;
+            if (b.MoveModule == null) return point;
+            switch (b.MoveModule.ShapeOfAttack)
+            {
+                case EShapeOfAttack.Point: return point;
+                case EShapeOfAttack.Directional: return !pointFallback || movingDir.sqrMagnitude > 0.000001f ? movingDir : point;
+                default: return Vector2.zero;
+            }
+        }
+
         /// <summary>How a client registered a bullet hit; the host mirrors the matching vanilla path.</summary>
         public const byte BulletHitKind_Overlap = 0;   // Bullet.Update overlap test
         public const byte BulletHitKind_Ray = 1;       // BulletMoveModule_RaycastArrow hitscan

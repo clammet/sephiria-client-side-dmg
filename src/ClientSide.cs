@@ -372,6 +372,7 @@ namespace ClientSideDamage
             public int reported;           // reports the host has (optimistically) counted towards pierce
             public bool hasLast;
             public Vector3 lastPos;
+            public float testUntil;        // keep testing until then after the host switched collision off (our copy lags behind the host's)
             public readonly List<Attacked> attacked = new List<Attacked>();
 
             public int IndexOf(CombatBehaviour cb)
@@ -390,10 +391,21 @@ namespace ClientSideDamage
             if (b != null) _bullets.Remove(b);
         }
 
-        /// <summary>Host pushed the authoritative Bullet.isCollisionEnabled value.</summary>
+        /// <summary>
+        /// Host pushed the authoritative Bullet.isCollisionEnabled value. Collision-off also comes
+        /// with a bullet the host parked at a wall (see ServerSide.TryParkBulletDestroy): our
+        /// interpolated copy is still one buffer behind the host's and may not have reached the
+        /// target yet, so a bullet we were testing keeps being tested for a short grace.
+        /// </summary>
         public static void OnBulletCollisionSync(Bullet b, bool enabled)
         {
             if (b == null) return;
+            if (!enabled && b.isCollisionEnabled && b.isClient && !b.isServer)
+            {
+                BulletTrack track;
+                if (!_bullets.TryGetValue(b, out track)) { track = new BulletTrack(); _bullets[b] = track; }   // parked before our first Update of it
+                track.testUntil = Time.time + ServerSide.ClientTestGrace;
+            }
             b.isCollisionEnabled = enabled;
         }
 
@@ -465,7 +477,8 @@ namespace ClientSideDamage
             Vector2 moveDir = track.hasLast ? (Vector2)(pos - track.lastPos) : Vector2.zero;
             track.lastPos = pos;
             track.hasLast = true;
-            if (!b.isCollisionEnabled || track.phase != 0 || b.attackingCollider == null) return;
+            bool testing = b.isCollisionEnabled || Time.time < track.testUntil;
+            if (!testing || track.phase != 0 || b.attackingCollider == null) return;
 
             PlayerAvatar me = LocalAvatar;
             if (me == null) return;
@@ -529,20 +542,7 @@ namespace ClientSideDamage
 
         private static bool ConsiderBulletHit(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Transform t, Vector3 bulletPos, Vector2 moveDir)
         {
-            Vector2 dir;
-            if (b.MoveModule == null)
-            {
-                dir = t.position - bulletPos;
-            }
-            else
-            {
-                switch (b.MoveModule.ShapeOfAttack)
-                {
-                    case EShapeOfAttack.Point: dir = t.position - bulletPos; break;
-                    case EShapeOfAttack.Directional: dir = moveDir.sqrMagnitude > 0.000001f ? moveDir.normalized : (Vector2)(t.position - bulletPos); break;
-                    default: dir = Vector2.zero; break;
-                }
-            }
+            Vector2 dir = CsdUtil.VanillaHitDirection(b, bulletPos, t.position, moveDir.normalized, true);
             return ReportBulletHit(b, track, me, own, t, CsdUtil.BulletHitKind_Overlap, dir);
         }
 

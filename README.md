@@ -47,7 +47,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.3.0 loaded (protocol 7)
+   [Info   :Client Side Damage] Client Side Damage 1.3.1 loaded (protocol 8)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +58,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.3.0 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.3.1 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.3.0 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.3.1 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -154,15 +154,23 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   and the host moves its bullet there before applying the hit, so hit FX and above all a
   destroy-on-hit explosion happen where the client saw the contact (centred on the victim, from
   the front, blockable like vanilla's) instead of speed × RTT further along; a bullet that survives
-  the hit (pierce, dodge) is put back in the same frame. And **parking** - a bullet that wants to
-  destroy itself normally (wall, lifetime) while somebody who might have reported it is within
-  reach (its speed × the round trip: an enemy hitbox for a client-owned bullet, the client's own
-  player for a hostile one) is frozen where it is instead (its `Update` is skipped; clients are
-  told its collision is off so nobody keeps testing the frozen bullet). A report arriving within
-  the grace (2×RTT + 0.15 s, 0.3–2 s) is applied with the rewind above; without one the bullet is
-  destroyed vanilla-style where it was parked, just late. Bullets driven by a `TopdownRigidbody`
-  (lobbed / physical projectiles) and bullets that do not die on contact (bounce, boomerang, hover)
-  are never parked; `forceDestroy` (a swing cutting a bullet, owner death, floor change) never is.
+  the hit (pierce, dodge, a destroy module that keeps it alive) is put back in the same frame. The
+  reported position must be finite and within the park reach of the host's copy, otherwise the hit
+  is applied where the host has the bullet. And **parking** - a bullet that wants to destroy
+  itself normally while somebody who might have reported it is within reach (its speed × the round
+  trip, measured from its hit volume: an enemy hitbox for a client-owned bullet, the client's own
+  player for a hostile one) is frozen where it is instead (its `Update` is skipped and it registers
+  no more host hits; clients are told its collision is off and keep testing it for 0.25 s so their
+  lagging copy can still reach the target). A report arriving within the grace (2×RTT + 0.4 s,
+  0.45–2 s) is applied with the rewind above; without one the bullet is destroyed vanilla-style
+  where it was parked, just late. Only *misses* are parked: a destroy issued because the bullet just
+  hit somebody (pierce exhausted) is not, and a bullet whose destroy module carries a payload
+  (explosion, spread, ground fire...) is only parked when it hit a wall - its timer / arrival /
+  landing destroy is the detonation and happens on time. A bullet parked for a host-detected hit
+  that is waiting for the client's reply is kept until that reply is in (or timed out) and released
+  right after. Bullets driven by a `TopdownRigidbody` (lobbed / physical projectiles), lasers,
+  owner-attached bullets and bullets that do not die on contact (bounce, boomerang, hover) are
+  never parked; `forceDestroy` (a swing cutting a bullet, owner death, floor change) never is.
   Visible cost: a near-miss bullet rests on the wall for up to the grace before it explodes; a hit
   one visibly jumps back from the wall to the victim to explode there.
 

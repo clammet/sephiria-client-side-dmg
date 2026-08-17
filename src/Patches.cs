@@ -68,7 +68,8 @@ namespace ClientSideDamage
             if (!NetworkServer.active || !Plugin.On) return true;
             try
             {
-                if (ServerSide.ShouldSuppressBulletServerHit(__instance, hit) || ServerSide.TryParkBulletHit(__instance, hit))
+                // a parked bullet is frozen: the rest of the Update that parked it must not register hits either
+                if (ServerSide.IsParked(__instance) || ServerSide.ShouldSuppressBulletServerHit(__instance, hit) || ServerSide.TryParkBulletHit(__instance, hit))
                 {
                     __result = false;
                     return false;
@@ -126,9 +127,40 @@ namespace ClientSideDamage
 
         private static void Postfix(Bullet __instance)
         {
-            if (NetworkServer.active) return;
+            if (NetworkServer.active)
+            {
+                try { ServerSide.OnBulletUpdatedHost(__instance); }
+                catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet update hook failed: " + e); }
+                return;
+            }
             try { ClientSide.OnBulletUpdate(__instance); }
             catch (Exception e) { Plugin.Log.LogError("[CSD/client] bullet detection failed: " + e); }
+        }
+
+        // vanilla Update threw: the postfix did not run, drop the per-Update moving state anyway
+        private static void Finalizer(Exception __exception)
+        {
+            if (__exception != null && NetworkServer.active) ServerSide.ClearMoving();
+        }
+    }
+
+    // host: which bullet is moving right now and whether its Move had tile contact - tells a DestroySelf
+    // issued from Bullet.Update's tile loop apart from a lifetime / arrival destroy (see ServerSide.TryParkBulletDestroy)
+    [HarmonyPatch(typeof(BulletMoveModule), "Move")]
+    internal static class Patch_BulletMoveModule_Move
+    {
+        private static void Prefix(BulletMoveModule __instance)
+        {
+            if (!NetworkServer.active) return;
+            try { ServerSide.OnBulletMoveBegin(__instance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet move hook failed: " + e); }
+        }
+
+        private static void Postfix(BulletMoveModule __instance, int __result)
+        {
+            if (!NetworkServer.active) return;
+            try { ServerSide.OnBulletMoveEnd(__instance, __result); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet move hook failed: " + e); }
         }
     }
 
