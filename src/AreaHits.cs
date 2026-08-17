@@ -1171,14 +1171,33 @@ namespace ClientSideDamage
         }
     }
 
-    // every Physics2D.Raycast(...) overload that returns a single hit ends up here
-    [HarmonyPatch(typeof(PhysicsScene2D), nameof(PhysicsScene2D.Raycast), new Type[] { typeof(Vector2), typeof(Vector2), typeof(float), typeof(ContactFilter2D) })]
-    internal static class AreaHook_PhysicsScene2D_Raycast
+    // Single-hit raycasts. The game only ever calls the static Physics2D.Raycast(origin, direction,
+    // distance, layerMask) wrapper (wall / tile checks everywhere, plus one boss laser that hits
+    // Hitboxes), so that is the method hooked.
+    //
+    // DO NOT hook PhysicsScene2D.Raycast(...) (the struct instance method the wrapper forwards to)
+    // or any other *struct* instance method that returns a struct: on this Mono runtime an instance
+    // method of a value type receives its "this" pointer in the first argument register and the
+    // hidden return-buffer pointer in the second, while the static replacement Harmony/MonoMod
+    // detours it to expects them the other way round (MonoMod's ThiscallStructRetPtr glue only
+    // covers class instance methods; for value types it stays at "Original"). The detoured raycast
+    // then never writes its caller's result - every wall / tree / cliff collision test in
+    // TopdownRigidbody silently missed and players walked through everything.
+    [HarmonyPatch(typeof(Physics2D), nameof(Physics2D.Raycast), new Type[] { typeof(Vector2), typeof(Vector2), typeof(float), typeof(int) })]
+    internal static class AreaHook_Physics2D_Raycast
     {
-        private static void Postfix(Vector2 __0, Vector2 __1, float __2, ContactFilter2D __3, RaycastHit2D __result)
+        private static void Postfix(Vector2 __0, Vector2 __1, float __2, int __3, RaycastHit2D __result)
         {
             if (!AreaRecorder.Armed) return;
-            try { AreaRecorder.OnRaycast(__0, __1, __2, __3, __result); }
+            try
+            {
+                // what Unity's legacy layer-mask overload builds internally (ContactFilter2D.CreateLegacyFilter)
+                ContactFilter2D f = default(ContactFilter2D);
+                f.useTriggers = Physics2D.queriesHitTriggers;
+                f.SetLayerMask(__3);
+                f.SetDepth(float.NegativeInfinity, float.PositiveInfinity);
+                AreaRecorder.OnRaycast(__0, __1, __2, f, __result);
+            }
             catch (Exception e) { AreaRecorder.LogHookError(e); }
         }
     }

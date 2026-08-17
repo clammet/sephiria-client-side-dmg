@@ -360,7 +360,7 @@ namespace ClientSideDamage
             return "all host features off in config";
         }
 
-        /// <summary>The host's own one-liner, e.g. "v1.2.0 host ON: guard/dodge, bullets, melee, area, fresh-pos".</summary>
+        /// <summary>The host's own one-liner, e.g. "v1.2.1 host ON: guard/dodge, bullets, melee, area, fresh-pos".</summary>
         public static string HostStatusLine()
         {
             CsdFeatures f = HostFeatures();
