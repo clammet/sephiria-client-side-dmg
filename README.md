@@ -1,5 +1,7 @@
 # Client Side Damage — Sephiria mod
 
+*Built by AI.*
+
 A BepInEx 5 plugin for **Sephiria** that makes the *joining* player's own game client the
 authority over its combat instead of the host:
 
