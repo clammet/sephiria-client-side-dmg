@@ -21,12 +21,22 @@
   Default: <GameDir>\BepInEx\core, falling back to ..\tools\bepinex\BepInEx\core
 #>
 param(
-    [string]$GameDir = (Join-Path $PSScriptRoot "..\Sephiria"),
+    [string]$GameDir = "",
     [string]$BepInExCore = ""
 )
 
 $ErrorActionPreference = "Stop"
 $root    = $PSScriptRoot
+if ($GameDir -eq "") {
+    # ..\Sephiria (a copy next to this repo), else the default Steam install
+    $candidates = @(
+        (Join-Path $root "..\Sephiria"),
+        (Join-Path ${env:ProgramFiles(x86)} "Steam\steamapps\common\Sephiria"),
+        (Join-Path $env:ProgramFiles "Steam\steamapps\common\Sephiria")
+    )
+    foreach ($c in $candidates) { if ($c -and (Test-Path (Join-Path $c "Sephiria_Data\Managed\Assembly-CSharp.dll"))) { $GameDir = $c; break } }
+    if ($GameDir -eq "") { throw "Sephiria install not found (looked in: $($candidates -join ', ')). Pass -GameDir <folder containing Sephiria.exe>." }
+}
 $managed = Join-Path $GameDir "Sephiria_Data\Managed"
 if (-not (Test-Path (Join-Path $managed "Assembly-CSharp.dll"))) { throw "Game assemblies not found in $managed" }
 

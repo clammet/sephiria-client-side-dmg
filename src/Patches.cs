@@ -98,6 +98,19 @@ namespace ClientSideDamage
         }
     }
 
+    // client-owned swings outlive their duration by an RTT-derived grace so the client's reports still
+    // find them (see ServerSide.TryDeferMeleeDestroy)
+    [HarmonyPatch(typeof(MeleeCollision), "DestroySelf")]
+    internal static class Patch_MeleeCollision_DestroySelf
+    {
+        private static bool Prefix(MeleeCollision __instance, bool forceDestroy)
+        {
+            if (!NetworkServer.active || !Plugin.On) return true;
+            try { return !ServerSide.TryDeferMeleeDestroy(__instance, forceDestroy); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] melee linger check failed: " + e); return true; }
+        }
+    }
+
     // ---------------------------------------------------------------- client side hit detection
 
     [HarmonyPatch(typeof(Bullet), "Update")]

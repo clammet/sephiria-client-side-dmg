@@ -640,6 +640,10 @@ namespace ClientSideDamage
             public float multiHitTimer;
             public int hitCount = 1;
             public readonly List<CombatBehaviour> attacked = new List<CombatBehaviour>();
+            public int frames;             // update frames seen (debug summary on the first ones)
+            public int found;              // colliders the shape test returned over the swing's life (debug)
+            public float age;              // seconds since we first saw the swing; testing stops at the swing's nominal duration
+            public bool expired;
         }
 
         private static readonly Dictionary<MeleeCollision, MeleeTrack> _melees = new Dictionary<MeleeCollision, MeleeTrack>();
@@ -658,17 +662,28 @@ namespace ClientSideDamage
         /// </summary>
         public static void OnMeleeSpawned(MeleeCollision m, UnitAvatar owner, Vector2 begin, Vector2 end, float height, float attachedDirection, float rangeBonus, Vector3 offset)
         {
-            if (m == null || !Active || !Has(CsdFeatures.MeleeHits) || !Plugin.ClientMeleeHitDetection.Value) return;
+            if (m == null) return;
+            if (!Active || !Has(CsdFeatures.MeleeHits) || !Plugin.ClientMeleeHitDetection.Value)
+            {
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee spawn " + m.name + " ignored: active=" + Active + " feature=" + Has(CsdFeatures.MeleeHits) + " cfg=" + Plugin.ClientMeleeHitDetection.Value);
+                return;
+            }
             if (!m.isClient || m.isServer) return;
             PlayerAvatar me = LocalAvatar;
-            if (me == null) return;
-            if (!CsdUtil.IsBaseMeleeUpdate(m)) return;
+            if (me == null) { if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee spawn " + m.name + " ignored: no local avatar"); return; }
+            if (!CsdUtil.IsBaseMeleeUpdate(m)) { if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee spawn " + m.name + " ignored: " + m.GetType().Name + " runs its own update loop (host side)"); return; }
 
             bool own = owner != null && owner == me;
             if (!own && owner != null)
             {
-                if (!CombatManager.ContainsAttackableFaction(owner.GetHostileFactionLayers(EDamageFromType.DirectAttack), me.faction)) return;
+                if (!CombatManager.ContainsAttackableFaction(owner.GetHostileFactionLayers(EDamageFromType.DirectAttack), me.faction))
+                {
+                    if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee spawn " + m.name + " ignored: owner " + owner.name + " (netId " + owner.netId + ") is neither us nor hostile");
+                    return;
+                }
             }
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee spawn " + m.name + " (" + m.GetType().Name + ", netId " + m.netId + ") owner=" + (owner != null ? owner.name + " netId " + owner.netId : "null")
+                + " own=" + own + " attach=" + m.attachOwnerPosition + " begin=" + begin + " end=" + end + " offset=" + offset + " dir=" + attachedDirection + " range=" + rangeBonus);
 
             MeleeTrack track;
             if (!_melees.TryGetValue(m, out track))
@@ -714,6 +729,23 @@ namespace ClientSideDamage
             UnitAvatar owner = track.owner;
             if (track.ownSwing && owner == null) { _melees.Remove(m); return; }
 
+            // The host keeps our own swings alive past their duration so that our (round-trip late)
+            // reports still find them; the hit window itself must stay vanilla's, so we test only
+            // for the swing's nominal duration (the same durationTimer vanilla runs on the host,
+            // counted from the moment we saw the swing).
+            if (track.ownSwing)
+            {
+                if (track.expired) return;
+                float life = m.durationTimer != null ? m.durationTimer.time : 0.33f;
+                if (track.age >= life)
+                {
+                    track.expired = true;
+                    if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee " + m.name + " (ours) done after " + track.frames + " frames / " + track.age.ToString("0.000") + "s (duration " + life.ToString("0.000") + "s), found " + track.found + " collider(s) in total");
+                    return;
+                }
+                track.age += Time.deltaTime;
+            }
+
             if (track.ownSwing && m.attachOwnerPosition)
             {
                 m.transform.position = owner.transform.position + AttachOffset(track, owner);
@@ -730,17 +762,37 @@ namespace ClientSideDamage
             }
 
             int n = R.MeleeCheckCollision(m, _meleeHits);
+            track.frames++;
+            track.found += n;
+            // debug: what the shape test sees on the first frames of a swing (and later on, only when it finds something)
+            bool verbose = Plugin.DebugOn && (track.frames <= 3 || n > 0) && track.frames <= 30;
+            System.Text.StringBuilder sb = verbose ? new System.Text.StringBuilder() : null;
+            if (sb != null)
+                sb.Append("[CSD/client] melee ").Append(m.name).Append(track.ownSwing ? " (ours)" : " (hostile)").Append(" frame ").Append(track.frames)
+                  .Append(" pos=").Append((Vector2)m.transform.position).Append(" ang=").Append(m.transform.eulerAngles.z.ToString("0")).Append(" found=").Append(n);
             for (int i = 0; i < n; i++)
             {
                 Collider2D c = _meleeHits[i];
                 if (c == null) continue;
-                if (owner != null && owner.transform == c.transform) continue;
-                CombatBehaviour cb = CsdUtil.CombatBehaviourFromCollider(c);
-                if (cb == null || (owner != null && cb == owner)) continue;
-                bool victimIsMe = cb == me;
-                if (track.ownSwing) { if (victimIsMe) continue; }
-                else if (!victimIsMe) continue;
-                if (track.attacked.Contains(cb)) continue;
+                string why = null;
+                CombatBehaviour cb = null;
+                bool victimIsMe = false;
+                if (owner != null && owner.transform == c.transform) why = "owner transform";
+                else
+                {
+                    cb = CsdUtil.CombatBehaviourFromCollider(c);
+                    if (cb == null) why = "no combat behaviour";
+                    else if (owner != null && cb == owner) why = "owner";
+                    else
+                    {
+                        victimIsMe = cb == me;
+                        if (track.ownSwing && victimIsMe) why = "us";
+                        else if (!track.ownSwing && !victimIsMe) why = "not us";
+                        else if (track.attacked.Contains(cb)) why = "already reported";
+                    }
+                }
+                if (sb != null) sb.Append(" | ").Append(c.name).Append('/').Append(c.transform.root.name).Append(cb != null ? " cb=" + cb.name : "").Append(why != null ? " -> " + why : " -> REPORT");
+                if (why != null) continue;
                 track.attacked.Add(cb);
 
                 Vector2 hitPoint = c.ClosestPoint(m.transform.position);
@@ -757,8 +809,9 @@ namespace ClientSideDamage
                     w.WriteBool(victimIsMe);
                     if (victimIsMe) snap.Write(w);
                 });
-                if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee " + m.name + " -> " + cb.name + (victimIsMe ? " " + snap : ""));
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee " + m.name + " -> " + cb.name + " (netId " + victimNetId + "/" + victimComponent + ")" + (victimIsMe ? " " + snap : ""));
             }
+            if (sb != null) Plugin.Debug(sb.ToString());
         }
     }
 }

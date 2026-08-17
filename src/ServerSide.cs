@@ -112,6 +112,7 @@ namespace ClientSideDamage
             _pending.Clear();
             _pendingPairs.Clear();
             _missCooldown.Clear();
+            _lingering.Clear();
             AreaRecorder.Clear();
         }
 
@@ -233,6 +234,64 @@ namespace ClientSideDamage
             {
                 float timeout = Plugin.HostReplyTimeout.Value;
                 DrainPending(p => now - p.createdAt > timeout, true, "timed out");
+            }
+            if (_lingering.Count > 0) TickLingeringMelee(now);
+        }
+
+        // ------------------------------------------------------------------ flow C: client-owned swings outlive their duration until the reports are in
+
+        /// <summary>
+        /// A swing performed by a modded client is hit-tested by that client and reported back;
+        /// the report arrives one round trip after the swing was spawned. Vanilla destroys the
+        /// swing after durationTimer (a katana swing lives ~0.15 s), so with a round trip longer
+        /// than that every report would find the swing already gone and be dropped - i.e. the
+        /// player would not hit anything at all. So a client-owned swing is kept alive (invisible,
+        /// and its own host-side hit test is already suppressed) for an RTT-derived grace period
+        /// after vanilla wanted to destroy it. The client stops testing at the swing's nominal
+        /// duration (see ClientSide.OnMeleeUpdate), so the hit window itself does not grow.
+        /// </summary>
+        private sealed class LingeringMelee
+        {
+            public MeleeCollision melee;
+            public float destroyAt;
+        }
+        private static readonly List<LingeringMelee> _lingering = new List<LingeringMelee>();
+
+        private static float MeleeGrace(ModdedClient mc)
+        {
+            double rtt = mc != null && mc.conn != null ? mc.conn.rtt : 0.0;
+            // two round trips (reports of the swing's last frames leave one duration after the first) plus jitter
+            return Mathf.Clamp((float)rtt * 2f + 0.15f, 0.3f, 2f);
+        }
+
+        /// <summary>MeleeCollision.DestroySelf prefix: true = keep the swing for now (destroyed from Tick later).</summary>
+        public static bool TryDeferMeleeDestroy(MeleeCollision m, bool forceDestroy)
+        {
+            if (forceDestroy || m == null || !NetworkServer.active || !Plugin.On || !Plugin.HostMeleeHitAuthority.Value) return false;
+            if (!m.isServer || m.netId == 0 || !CsdUtil.IsBaseMeleeUpdate(m)) return false;
+            ModdedClient mc = GetModdedClient(m.owner);
+            if (mc == null || (mc.features & CsdFeatures.MeleeHits) == 0) return false;
+            for (int i = 0; i < _lingering.Count; i++)
+            {
+                if (!ReferenceEquals(_lingering[i].melee, m)) continue;
+                return Time.time < _lingering[i].destroyAt;   // durationTimer fired again while lingering
+            }
+            float grace = MeleeGrace(mc);
+            _lingering.Add(new LingeringMelee { melee = m, destroyAt = Time.time + grace });
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] melee " + m.name + " (netId " + m.netId + ") of conn " + mc.conn.connectionId + " lingers " + grace.ToString("0.00") + "s for late reports (rtt " + (mc.conn.rtt * 1000.0).ToString("0") + " ms)");
+            return true;
+        }
+
+        private static void TickLingeringMelee(float now)
+        {
+            for (int i = _lingering.Count - 1; i >= 0; i--)
+            {
+                LingeringMelee l = _lingering[i];
+                if (l.melee == null) { _lingering.RemoveAt(i); continue; }   // destroyed by other means (floor move, owner gone)
+                if (now < l.destroyAt) continue;
+                _lingering.RemoveAt(i);
+                try { l.melee.DestroySelf(true); }
+                catch (Exception e) { Plugin.Log.LogError("[CSD/host] destroying lingering swing failed: " + e); }
             }
         }
 
@@ -360,7 +419,7 @@ namespace ClientSideDamage
             return "all host features off in config";
         }
 
-        /// <summary>The host's own one-liner, e.g. "v1.2.1 host ON: guard/dodge, bullets, melee, area, fresh-pos".</summary>
+        /// <summary>The host's own one-liner, e.g. "v1.2.3 host ON: guard/dodge, bullets, melee, area, fresh-pos".</summary>
         public static string HostStatusLine()
         {
             CsdFeatures f = HostFeatures();
@@ -993,11 +1052,16 @@ namespace ClientSideDamage
                 w.WriteFloat(height); w.WriteFloat(dir); w.WriteFloat(rangeBonus);
                 w.WriteVector3(offset);
             };
+            int sent = 0;
             foreach (ModdedClient mc in _clients.Values)
             {
                 if (!mc.acked || (mc.features & CsdFeatures.MeleeHits) == 0 || mc.conn == null || !mc.conn.isReady) continue;
                 CsdRpc.SendToClient(m, mc.conn, CsdRpc.MeleeSpawn, payload);
+                sent++;
             }
+            if (Plugin.DebugOn && sent > 0)
+                Plugin.Debug("[CSD/host] melee spawn " + m.name + " (" + m.GetType().Name + ", netId " + m.netId + ") owner=" + (m.owner != null ? m.owner.name + " netId " + ownerNetId : "null")
+                    + " client-owned=" + IsClientAuthoritative(m.owner, CsdFeatures.MeleeHits) + " -> " + sent + " client(s)");
         }
 
         public static void OnBulletHit(UnitAvatar avatar, NetworkConnectionToClient sender, uint bulletNetId, uint victimNetId, byte victimComponent, byte kind, Vector2 direction, bool hasSnapshot, CombatSnapshot snap)
@@ -1172,19 +1236,28 @@ namespace ClientSideDamage
         {
             PlayerAvatar me = avatar as PlayerAvatar;
             ModdedClient mc = GetModdedClient(me);
-            if (mc == null || mc.conn != sender || (mc.features & CsdFeatures.MeleeHits) == 0) return;
-            if (!Plugin.HostMeleeHitAuthority.Value) return;
+            string drop = null;
+            if (mc == null || mc.conn != sender || (mc.features & CsdFeatures.MeleeHits) == 0) drop = "sender not a melee-authoritative client";
+            else if (!Plugin.HostMeleeHitAuthority.Value) drop = "Host.MeleeHitAuthority off";
+            if (drop != null) { if (Plugin.DebugOn) Plugin.Debug("[CSD/host] melee report from conn " + sender.connectionId + " dropped: " + drop); return; }
 
             MeleeCollision m = CsdUtil.FindComponent<MeleeCollision>(NetworkServer.spawned, meleeNetId);
-            if (m == null || !m.isServer || !CsdUtil.IsBaseMeleeUpdate(m)) return;
             CombatBehaviour victim = CsdUtil.FindBehaviour(NetworkServer.spawned, victimNetId, victimComponent) as CombatBehaviour;
-            if (victim == null) return;
-            bool ownSwing = m.owner != null && m.owner == me;
-            bool victimIsMe = victim == me;
-            if (!ownSwing && !victimIsMe) return;   // a client may only register hits that involve itself
-            if (ownSwing && victimIsMe) return;
-            Transform hitT = CsdUtil.FindHitboxTransform(victim);
-            if (hitT == null) return;
+            bool ownSwing = m != null && m.owner != null && m.owner == me;
+            bool victimIsMe = victim != null && victim == me;
+            Transform hitT = victim != null ? CsdUtil.FindHitboxTransform(victim) : null;
+            if (m == null) drop = "swing netId " + meleeNetId + " not spawned (already gone?)";
+            else if (!m.isServer) drop = "swing not server side";
+            else if (!CsdUtil.IsBaseMeleeUpdate(m)) drop = m.GetType().Name + " runs its own update loop";
+            else if (victim == null) drop = "victim netId " + victimNetId + "/" + victimComponent + " not found";
+            else if (!ownSwing && !victimIsMe) drop = "neither our swing nor us as victim (owner=" + (m.owner != null ? m.owner.name : "null") + ")";   // a client may only register hits that involve itself
+            else if (ownSwing && victimIsMe) drop = "own swing against ourselves";
+            else if (hitT == null) drop = "victim " + victim.name + " has no hitbox";
+            if (drop != null)
+            {
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] melee report from conn " + sender.connectionId + " (swing " + meleeNetId + " -> " + victimNetId + "/" + victimComponent + ") dropped: " + drop);
+                return;
+            }
 
             bool force = victimIsMe && hasSnapshot && (mc.features & CsdFeatures.DamageTakenAuthority) != 0;
             bool hit = RunProjectile(me, force, snap, () => R.MeleeAttack(m, 0, hitPoint, hitT));

@@ -47,7 +47,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.2.1 loaded (protocol 5)
+   [Info   :Client Side Damage] Client Side Damage 1.2.3 loaded (protocol 6)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +58,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.2.1 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.2.3 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.2.1 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.2.3 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -163,6 +163,12 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   swings whose owner or victim is a modded client. Only swing types that use the base update loop
   are handled this way; `MeleeCollision_Circle_Distance` stays host-side (host detects, then asks
   the client for its guard/dodge state through the damage query).
+  A swing lives only a few frames (a katana swing ~0.15 s) while the client's report needs a full
+  round trip, so the host keeps a modded client's **own** swings alive for an RTT-derived grace
+  period (2×RTT + 0.15 s, 0.3–2 s) after vanilla would have destroyed them - invisible, and their
+  host-side hit test is off anyway - so the reports still find the swing (`MeleeCollision.DestroySelf`
+  prefix). The client stops testing at the swing's nominal `durationTimer`, so the hit window itself
+  stays vanilla's; only the moment the damage lands is one round trip late.
 
 * **Client state prediction**: dash i-frames are predicted locally when `CharacterDash.StartDash`
   runs (`dodgeInvincibleTime + DashInvincibleTimeBonus`); the guard is taken from the synced
@@ -222,7 +228,10 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   are dead / invulnerable / life-invincible / pit / peace-mode / faction - so a late hit against a
   target that has since died or been revived (revive grants invulnerability) is rejected.
 * Late hit reports for projectiles the host already destroyed are dropped (netIds are never
-  reused in a session). Late damage replies after the timeout are dropped (no double apply).
+  reused in a session; the host logs `melee report ... dropped: swing netId N not spawned` with
+  `DebugLog` on). Client-owned swings linger for the grace period described above so this only
+  affects them under extreme lag; bullets are not lingered (a bullet that has hit a wall or expired
+  before the report arrives is gone). Late damage replies after the timeout are dropped (no double apply).
 * Floor moves (`DungeonManager.LocalMoveFloor`) and scene changes drop parked damage queries for
   the moving player, so nothing from the previous floor lands after the teleport.
 * All mod traffic uses Mirror's reliable channel: packet loss only delays, it never loses a hit
@@ -287,7 +296,12 @@ Output: `dist\ClientSideDamage.dll`.
   them the mod logs `RPC hash collision` and switches itself off for the session, the game's
   handler wins.
 * Host and client must run the same mod **protocol** version (`PROTOCOL_VERSION`, logged at
-  start-up); mismatches disable the mod for that pair with a warning.
+  start-up); mismatches disable the mod for that pair with a warning (the host's chat line then
+  says `OFF - mod version mismatch (host protocol N, theirs M)`). The protocol number is bumped with every release that changes
+  behaviour on both sides, so everybody in a session is on the same build.
 * Tested to load and patch cleanly in the game; the multiplayer behaviour itself needs a
   two-PC (or two-instance) session to verify — turn on `General.DebugLog` on both sides and
-  compare `BepInEx\LogOutput.log` if something looks off.
+  compare `BepInEx\LogOutput.log` if something looks off. Every mod log line carries a local wall
+  clock stamp with its UTC offset (`[17:39:50.223+09:00 t=173.96]`, `t` = seconds since the game started), so a host log
+  and a client log from different time zones can be lined up by subtracting the offsets; the first mod line states
+  the date and time zone.

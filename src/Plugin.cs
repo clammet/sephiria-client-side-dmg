@@ -12,10 +12,10 @@ namespace ClientSideDamage
     {
         public const string GUID = "com.sephiria.clientsidedamage";
         public const string NAME = "Client Side Damage";
-        public const string VERSION = "1.2.1";
+        public const string VERSION = "1.2.3";
 
         // Bumped whenever the wire format of any RPC changes. Host and client must match.
-        public const int PROTOCOL_VERSION = 5;
+        public const int PROTOCOL_VERSION = 6;
 
         public static CsdLogger Log;
         public static Harmony HarmonyInstance;
@@ -179,17 +179,25 @@ namespace ClientSideDamage
     }
 
     /// <summary>
-    /// BepInEx's log has no timestamps; every line of ours is prefixed with the wall clock and the
-    /// game's unscaled time (seconds since start) so events can be lined up with what was on screen.
+    /// BepInEx's log has no timestamps; every line of ours is prefixed with the local wall clock
+    /// plus its UTC offset (ISO 8601 style, e.g. 17:39:50.223+09:00 - readable for the person at
+    /// that machine, and a host log and a client log from different time zones can still be
+    /// lined up by subtracting the offsets) and the game's unscaled time (seconds since start) so
+    /// events can be matched with what was on screen.
     /// </summary>
     public sealed class CsdLogger
     {
         private readonly ManualLogSource _log;
-        public CsdLogger(ManualLogSource log) { _log = log; }
+        public CsdLogger(ManualLogSource log)
+        {
+            _log = log;
+            _log.LogInfo(Stamp() + "[CSD] log stamps are local time with UTC offset (" + DateTime.Now.ToString("yyyy-MM-dd") + ", " + TimeZoneInfo.Local.StandardName + ")");
+        }
 
         private static string Stamp()
         {
-            return "[" + DateTime.Now.ToString("HH:mm:ss.fff") + " t=" + Time.unscaledTime.ToString("0.00") + "] ";
+            DateTime now = DateTime.Now;
+            return "[" + now.ToString("HH:mm:ss.fff") + now.ToString("zzz") + " t=" + Time.unscaledTime.ToString("0.00") + "] ";
         }
 
         public void LogInfo(object msg) { _log.LogInfo(Stamp() + msg); }
