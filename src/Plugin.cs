@@ -12,10 +12,10 @@ namespace ClientSideDamage
     {
         public const string GUID = "com.sephiria.clientsidedamage";
         public const string NAME = "Client Side Damage";
-        public const string VERSION = "1.3.1";
+        public const string VERSION = "1.4.0";
 
         // Bumped whenever the wire format of any RPC changes. Host and client must match.
-        public const int PROTOCOL_VERSION = 8;
+        public const int PROTOCOL_VERSION = 9;
 
         public static CsdLogger Log;
         public static Harmony HarmonyInstance;

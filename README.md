@@ -47,7 +47,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.3.1 loaded (protocol 8)
+   [Info   :Client Side Damage] Client Side Damage 1.4.0 loaded (protocol 9)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +58,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.3.1 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.4.0 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.3.1 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.4.0 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -173,6 +173,16 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   never parked; `forceDestroy` (a swing cutting a bullet, owner death, floor change) never is.
   Visible cost: a near-miss bullet rests on the wall for up to the grace before it explodes; a hit
   one visibly jumps back from the wall to the victim to explode there.
+
+  The growth-parry charm's `DaggerGrowthBullet` is also covered even though it is a plain
+  `MonoBehaviour`, not a network-spawned `Bullet`. Immediately before vanilla's reliable spawn RPC,
+  the host assigns the dagger a temporary CSD id (`CSD::DaggerSpawn`). Each client correlates that
+  id with its independently-created visual and runs vanilla's `HorayPhysics2D.OverlapCircle` test
+  after the same movement update. Hits involving that client are reported with `CSD::DaggerHit`;
+  the host validates the id, owner, faction and reported point against the dagger's fixed path, then
+  constructs vanilla's projectile/DirectAttack/Chaos `DamageInstance` from its authoritative spawn
+  data. The host's own observation is suppressed only when the owner or victim has negotiated
+  `BulletHits`. If both are modded, the victim's report wins so its guard/dodge snapshot is used.
 
 * **Melee** (`MeleeCollision`): swings are network-spawned objects with the same shape data on
   both sides and a `NetworkTransformReliable`. Right after the spawn the host sends modded clients
@@ -310,13 +320,13 @@ Output: `dist\ClientSideDamage.dll`.
 
 ## Compatibility notes
 
-* Built against Sephiria build 8/14/2026 (Unity 6000.3.21, Mirror). Every game member the mod
+* Built against Sephiria build 8/21/2026 (Unity 6000.3.21, Mirror). Every game member the mod
   touches through accessors is resolved at start-up and every Harmony patch is applied inside
   the same guarded step; if a game update renames something the plugin logs
   `Failed to initialise (game version mismatch?)`, rolls back whatever patches were already
   applied and stays dormant instead of half-working.
 * Mirror keeps only 16 bits of an RPC name hash and silently overwrites the registry on a
-  clash. The mod checks its nine hashes are free when it registers them and watches every later
+  clash. The mod checks its twelve hashes are free when it registers them and watches every later
   registration (the game's RPCs register lazily, per type); should a game RPC ever land on one of
   them the mod logs `RPC hash collision` and switches itself off for the session, the game's
   handler wins.

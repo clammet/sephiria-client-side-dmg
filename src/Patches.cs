@@ -16,6 +16,11 @@ namespace ClientSideDamage
             try
             {
                 EApplyDamageResult r;
+                if (ServerSide.TrySuppressDaggerServerDamage(__instance, damage, out r))
+                {
+                    __result = r;
+                    return false;
+                }
                 if (ServerSide.TryHandleApplyDamage(__instance, damage, out r))
                 {
                     __result = r;
@@ -234,6 +239,76 @@ namespace ClientSideDamage
         {
             ClientSide.OnBulletGone(__instance);
             if (NetworkServer.active) ServerSide.OnBulletGoneHost(__instance);
+        }
+    }
+
+    // Growth-parry daggers are not Mirror NetworkBehaviours. Correlate the independently
+    // instantiated host/client copies and run their vanilla circle hit test on authoritative clients.
+    [HarmonyPatch(typeof(Charm_GrowthParry), "RpcCreateBullet", new Type[] { typeof(Vector2), typeof(Vector2), typeof(float) })]
+    internal static class Patch_CharmGrowthParry_RpcCreateBullet
+    {
+        private static void Prefix(Charm_GrowthParry __instance, Vector2 spawnPosition, Vector2 direction, float damage)
+        {
+            if (!NetworkServer.active || __instance == null) return;
+            try
+            {
+                DaggerGrowthBullet template = __instance.bulletPrefab != null ? __instance.bulletPrefab.GetComponent<DaggerGrowthBullet>() : null;
+                ServerSide.OnDaggerSpawn(__instance.NetworkAvatar, template, spawnPosition, direction, damage);
+            }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] growth dagger spawn sync failed: " + e); }
+        }
+    }
+
+    [HarmonyPatch(typeof(DaggerGrowthBullet), "Initialize", new Type[] { typeof(UnitAvatar), typeof(Vector2), typeof(Vector2), typeof(float), typeof(bool) })]
+    internal static class Patch_DaggerGrowthBullet_Initialize
+    {
+        private static void Postfix(DaggerGrowthBullet __instance, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject)
+        {
+            try
+            {
+                ServerSide.OnDaggerInitialized(__instance, owner, position, direction, damage, isServerObject);
+                ClientSide.OnDaggerInitialized(__instance, owner, position, direction, damage, isServerObject);
+            }
+            catch (Exception e) { Plugin.Log.LogError("[CSD] growth dagger initialise tracking failed: " + e); }
+        }
+    }
+
+    [HarmonyPatch(typeof(DaggerGrowthBullet), "Update")]
+    internal static class Patch_DaggerGrowthBullet_Update
+    {
+        private static void Postfix(DaggerGrowthBullet __instance)
+        {
+            try { ClientSide.OnDaggerUpdate(__instance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/client] growth dagger hit test failed: " + e); }
+        }
+    }
+
+    [HarmonyPatch(typeof(DaggerGrowthBullet), "HitCheck")]
+    internal static class Patch_DaggerGrowthBullet_HitCheck
+    {
+        private static void Prefix(DaggerGrowthBullet __instance, out DaggerGrowthBullet __state)
+        {
+            __state = ServerSide.PushDaggerHitCheck(__instance);
+        }
+
+        private static Exception Finalizer(Exception __exception, DaggerGrowthBullet __state)
+        {
+            ServerSide.PopDaggerHitCheck(__state);
+            return __exception;
+        }
+    }
+
+    [HarmonyPatch(typeof(DaggerGrowthBullet), "OnDestroy")]
+    internal static class Patch_DaggerGrowthBullet_OnDestroy
+    {
+        private static void Prefix(DaggerGrowthBullet __instance)
+        {
+            try
+            {
+                ServerSide.OnDaggerGone(__instance);
+                ClientSide.OnDaggerGone(__instance);
+            }
+            catch (Exception e) { Plugin.Log.LogError("[CSD] growth dagger cleanup failed: " + e); }
         }
     }
 

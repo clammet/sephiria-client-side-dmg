@@ -24,11 +24,13 @@ namespace ClientSideDamage
         public const string BulletHitResult = "CSD::BulletHitResult";
         public const string BulletCollision = "CSD::BulletCollision";   // registered on Bullet, not UnitAvatar
         public const string MeleeSpawn = "CSD::MeleeSpawn";             // registered on MeleeCollision
+        public const string DaggerSpawn = "CSD::DaggerSpawn";           // correlates the game's non-networked DaggerGrowthBullet copies
         // client -> server (Command on the player's own avatar)
         public const string HelloAck = "CSD::HelloAck";
         public const string DamageReply = "CSD::DamageReply";
         public const string BulletHit = "CSD::BulletHit";
         public const string MeleeHit = "CSD::MeleeHit";
+        public const string DaggerHit = "CSD::DaggerHit";
 
         /// <summary>What the host did with a reported bullet hit (mirrors Bullet.AttackOnServer's bookkeeping).</summary>
         public const byte HitResult_NotApplied = 0;   // Fail_Absolute or never applied: vanilla would test this pair again
@@ -69,10 +71,12 @@ namespace ClientSideDamage
                 new Entry(ua, BulletHitResult, OnBulletHitResult, false),
                 new Entry(typeof(Bullet), BulletCollision, OnBulletCollision, false),
                 new Entry(typeof(MeleeCollision), MeleeSpawn, OnMeleeSpawn, false),
+                new Entry(ua, DaggerSpawn, OnDaggerSpawn, false),
                 new Entry(ua, HelloAck, OnHelloAck, true),
                 new Entry(ua, DamageReply, OnDamageReply, true),
                 new Entry(ua, BulletHit, OnBulletHit, true),
                 new Entry(ua, MeleeHit, OnMeleeHit, true),
+                new Entry(ua, DaggerHit, OnDaggerHit, true),
             };
             _ourHashes.Clear();
             for (int i = 0; i < _table.Length; i++)
@@ -215,6 +219,20 @@ namespace ClientSideDamage
             });
         }
 
+        private static void OnDaggerSpawn(NetworkBehaviour obj, NetworkReader reader, NetworkConnectionToClient sender)
+        {
+            Guard("OnDaggerSpawn", () =>
+            {
+                uint daggerId = reader.ReadUInt();
+                uint ownerNetId = reader.ReadUInt();
+                Vector2 position = reader.ReadVector2();
+                Vector2 direction = reader.ReadVector2();
+                float damage = reader.ReadFloat();
+                if (!Plugin.Ready || !NetworkClient.active || NetworkServer.active) return;
+                ClientSide.OnDaggerSpawn(obj as UnitAvatar, daggerId, ownerNetId, position, direction, damage);
+            });
+        }
+
         private static void OnDamageQuery(NetworkBehaviour obj, NetworkReader reader, NetworkConnectionToClient sender)
         {
             Guard("OnDamageQuery", () =>
@@ -283,6 +301,23 @@ namespace ClientSideDamage
                 if (hasSnapshot) snap = CombatSnapshot.Read(reader);
                 if (!Plugin.Ready || !NetworkServer.active) return;
                 ServerSide.OnMeleeHit(obj as UnitAvatar, sender, meleeNetId, victimNetId, victimComponent, hitPoint, hasSnapshot, snap);
+            });
+        }
+
+        private static void OnDaggerHit(NetworkBehaviour obj, NetworkReader reader, NetworkConnectionToClient sender)
+        {
+            Guard("OnDaggerHit", () =>
+            {
+                uint daggerId = reader.ReadUInt();
+                uint victimNetId = reader.ReadUInt();
+                byte victimComponent = reader.ReadByte();
+                Vector2 daggerPosition = reader.ReadVector2();
+                Vector2 hitPoint = reader.ReadVector2();
+                bool hasSnapshot = reader.ReadBool();
+                CombatSnapshot snap = default(CombatSnapshot);
+                if (hasSnapshot) snap = CombatSnapshot.Read(reader);
+                if (!Plugin.Ready || !NetworkServer.active) return;
+                ServerSide.OnDaggerHit(obj as UnitAvatar, sender, daggerId, victimNetId, victimComponent, daggerPosition, hitPoint, hasSnapshot, snap);
             });
         }
     }

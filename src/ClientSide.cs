@@ -88,6 +88,7 @@ namespace ClientSideDamage
             _guardStartTime = -1f;
             _dashInvincibleUntil = -1f;
             _bullets.Clear();
+            _daggers.Clear();
             _melees.Clear();
             _queries.Clear();
             _myHitboxes = null;
@@ -96,10 +97,11 @@ namespace ClientSideDamage
 
         public static void Tick()
         {
-            if (!NetworkClient.active && (_hostModded || _bullets.Count > 0 || _melees.Count > 0 || _queries.Count > 0)) Reset();
+            if (!NetworkClient.active && (_hostModded || _bullets.Count > 0 || _daggers.Count > 0 || _melees.Count > 0 || _queries.Count > 0)) Reset();
             SelfLineTick();
             if (!Plugin.Ready) return;
             if (_queries.Count > 0) AnswerQueries();
+            if (_daggers.Count > 0) CleanupDaggerTracks();
         }
 
         // ------------------------------------------------------------------ self status lines (local HUD log only)
@@ -629,6 +631,195 @@ namespace ClientSideDamage
                 Transform t = _rayHits[i].transform;
                 if (t == null) continue;
                 if (ReportBulletHit(b, track, me, own, t, CsdUtil.BulletHitKind_Ray, dir)) reported++;
+            }
+        }
+
+        // ------------------------------------------------------------------ DaggerGrowthBullet
+
+        /// <summary>
+        /// Growth-parry daggers are ordinary MonoBehaviours, not Mirror-spawned Bullets. Vanilla's
+        /// reliable RpcCreateBullet creates one independent copy on every peer. The host sends a
+        /// small CSD spawn record immediately before that RPC so the copies can be correlated by a
+        /// mod-local id; either message may still be observed first, so matching works both ways.
+        /// </summary>
+        private sealed class DaggerTrack
+        {
+            public uint id;
+            public uint ownerNetId;
+            public DaggerGrowthBullet projectile;
+            public UnitAvatar owner;
+            public Vector2 spawnPosition;
+            public Vector2 direction;
+            public float damage;
+            public float createdAt;
+            public BulletRelevance relevance;
+            public float traveled;
+            public float currentSpeed;
+            public bool decelerating;
+            public bool collisionFinished;
+            public readonly HashSet<CombatBehaviour> attacked = new HashSet<CombatBehaviour>();
+        }
+
+        private static readonly List<DaggerTrack> _daggers = new List<DaggerTrack>();
+        private static readonly Collider2D[] _daggerHits = new Collider2D[20];
+        private const float DaggerMatchLifetime = 3f;
+
+        public static void OnDaggerSpawn(UnitAvatar avatar, uint id, uint ownerNetId, Vector2 position, Vector2 direction, float damage)
+        {
+            if (id == 0 || avatar == null || !avatar.isOwned || !Active || !Has(CsdFeatures.BulletHits)) return;
+            for (int i = 0; i < _daggers.Count; i++) if (_daggers[i].id == id) return;
+
+            DaggerTrack match = null;
+            for (int i = 0; i < _daggers.Count; i++)
+            {
+                DaggerTrack t = _daggers[i];
+                if (t.id == 0 && t.projectile != null && DaggerMatches(t, ownerNetId, position, direction, damage))
+                {
+                    match = t;
+                    break;
+                }
+            }
+            if (match == null)
+            {
+                match = new DaggerTrack { createdAt = Time.time };
+                _daggers.Add(match);
+            }
+            match.id = id;
+            match.ownerNetId = ownerNetId;
+            match.spawnPosition = position;
+            match.direction = direction.sqrMagnitude > 0.0001f ? direction.normalized : Vector2.right;
+            match.damage = damage;
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/client] dagger spawn id " + id + " owner " + ownerNetId + (match.projectile != null ? " matched" : " queued"));
+        }
+
+        public static void OnDaggerInitialized(DaggerGrowthBullet projectile, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject)
+        {
+            if (projectile == null || isServerObject || !NetworkClient.active || NetworkServer.active) return;
+            uint ownerNetId = owner != null ? owner.netId : 0u;
+            DaggerTrack match = null;
+            for (int i = 0; i < _daggers.Count; i++)
+            {
+                DaggerTrack t = _daggers[i];
+                if (t.id != 0 && t.projectile == null && DaggerMatches(t, ownerNetId, position, direction, damage))
+                {
+                    match = t;
+                    break;
+                }
+            }
+            if (match == null)
+            {
+                match = new DaggerTrack
+                {
+                    ownerNetId = ownerNetId,
+                    spawnPosition = position,
+                    direction = direction.sqrMagnitude > 0.0001f ? direction.normalized : Vector2.right,
+                    damage = damage,
+                    createdAt = Time.time,
+                };
+                _daggers.Add(match);
+            }
+            match.projectile = projectile;
+            match.owner = owner;
+            match.currentSpeed = projectile.moveSpeed;
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/client] dagger visual " + projectile.name + (match.id != 0 ? " matched to id " + match.id : " awaiting spawn id"));
+        }
+
+        private static bool DaggerMatches(DaggerTrack t, uint ownerNetId, Vector2 position, Vector2 direction, float damage)
+        {
+            if (t.ownerNetId != ownerNetId) return false;
+            if ((t.spawnPosition - position).sqrMagnitude > 0.01f) return false;
+            Vector2 d = direction.sqrMagnitude > 0.0001f ? direction.normalized : Vector2.right;
+            if (Vector2.Dot(t.direction, d) < 0.999f) return false;
+            return Mathf.Abs(t.damage - damage) <= Mathf.Max(0.01f, Mathf.Abs(damage) * 0.001f);
+        }
+
+        private static void CleanupDaggerTracks()
+        {
+            float staleBefore = Time.time - DaggerMatchLifetime;
+            for (int i = _daggers.Count - 1; i >= 0; i--)
+            {
+                DaggerTrack t = _daggers[i];
+                if (t.projectile == null && t.createdAt < staleBefore) _daggers.RemoveAt(i);
+            }
+        }
+
+        public static void OnDaggerGone(DaggerGrowthBullet projectile)
+        {
+            if (projectile == null) return;
+            for (int i = _daggers.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(_daggers[i].projectile, projectile)) _daggers.RemoveAt(i);
+        }
+
+        public static void OnDaggerUpdate(DaggerGrowthBullet projectile)
+        {
+            if (projectile == null) return;
+            DaggerTrack track = null;
+            for (int i = 0; i < _daggers.Count; i++)
+            {
+                if (ReferenceEquals(_daggers[i].projectile, projectile)) { track = _daggers[i]; break; }
+            }
+            if (track == null) return;
+            try
+            {
+                if (track.collisionFinished || !Active || !Has(CsdFeatures.BulletHits) || !Plugin.ClientBulletHitDetection.Value || track.id == 0 || track.owner == null) return;
+
+                PlayerAvatar me = LocalAvatar;
+                if (me == null) return;
+                if (track.relevance == BulletRelevance.Unknown)
+                {
+                    if (track.owner == me) track.relevance = BulletRelevance.Own;
+                    else if (!CombatManager.ContainsAttackableFaction(track.owner.GetHostileFactionLayers(EDamageFromType.DirectAttack), me.faction)) track.relevance = BulletRelevance.Ignore;
+                    else track.relevance = BulletRelevance.Hostile;
+                }
+                if (track.relevance == BulletRelevance.Ignore) return;
+                bool own = track.relevance == BulletRelevance.Own;
+
+                Vector2 position = projectile.transform.position;
+                int n = HorayPhysics2D.OverlapCircle(position, projectile.hitRadius, _daggerHits, CombatManager.Topdown1FLayerMask);
+                for (int i = 0; i < n; i++)
+                {
+                    Collider2D c = _daggerHits[i];
+                    if (c == null || !c.TryGetComponent<Hitbox>(out Hitbox hitbox)) continue;
+                    CombatBehaviour cb = hitbox.GetCombatBehaviour(0);
+                    UnitAvatar victim = cb as UnitAvatar;
+                    if (victim == null || victim.IsDead || victim == track.owner) continue;
+                    if (!CombatManager.ContainsAttackableFaction(track.owner.GetHostileFactionLayers(EDamageFromType.DirectAttack), victim.faction)) continue;
+                    bool victimIsMe = victim == me;
+                    if (!own && !victimIsMe) continue;
+                    if (!track.attacked.Add(cb)) continue;   // vanilla DaggerGrowthBullet.hitTargets is permanent, even on Fail_Absolute
+
+                    uint victimNetId = cb.netId;
+                    byte victimComponent = (byte)cb.ComponentIndex;
+                    Vector2 hitPoint = c.ClosestPoint(position);
+                    CombatSnapshot snap = victimIsMe ? Capture(me) : default(CombatSnapshot);
+                    CsdRpc.SendToServer(me, CsdRpc.DaggerHit, w =>
+                    {
+                        w.WriteUInt(track.id);
+                        w.WriteUInt(victimNetId);
+                        w.WriteByte(victimComponent);
+                        w.WriteVector2(position);
+                        w.WriteVector2(hitPoint);
+                        w.WriteBool(victimIsMe);
+                        if (victimIsMe) snap.Write(w);
+                    });
+                    if (Plugin.DebugOn) Plugin.Debug("[CSD/client] growth dagger " + track.id + " -> " + cb.name + (victimIsMe ? " " + snap : ""));
+                }
+            }
+            finally
+            {
+                // Mirror vanilla's private Fly -> Decelerate phase closely enough to stop testing
+                // on the same zero-speed frame; WaitDespawn / Despawn are visual-only.
+                float dt = Time.deltaTime;
+                if (!track.decelerating)
+                {
+                    track.traveled += track.currentSpeed * dt;
+                    if (track.traveled >= projectile.travelDistance) track.decelerating = true;
+                }
+                else
+                {
+                    track.currentSpeed = Mathf.MoveTowards(track.currentSpeed, 0f, projectile.deceleration * dt);
+                    if (track.currentSpeed <= 0f) track.collisionFinished = true;
+                }
             }
         }
 

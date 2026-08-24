@@ -1,4 +1,9 @@
 Testing notes:
+- Since 1.4.0 the growth-parry `DaggerGrowthBullet` uses a CSD spawn id because vanilla creates it
+  independently on every peer instead of network-spawning it. Test both directions: a joined
+  player's dagger hitting a monster, and another player's dagger hitting the joined player (guard,
+  perfect guard, dodge, and a visual miss). With debug logging, the spawn id should be matched on
+  the client before its first hit and each accepted pair should appear once on the host.
 - A host-detected bullet vs. a modded player is not consumed until the reply arrives (≈RTT). Since 1.3.0 such a
   bullet is parked (frozen) if it wants to destroy itself in that window and the replay rewinds it to where the hit
   was detected, so a wall right behind the player no longer loses the hit (regardless of the bullet-hit feature: it

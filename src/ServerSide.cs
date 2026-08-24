@@ -102,6 +102,29 @@ namespace ClientSideDamage
         [ThreadStatic] public static bool ProjectileBypass;
         /// <summary>The bullet whose Bullet.DestroySelf must run vanilla-style right now (being released from the park, or consumed by a reported hit).</summary>
         [ThreadStatic] public static Bullet BulletDestroyBypass;
+        /// <summary>The non-networked growth-parry dagger whose vanilla HitCheck is currently applying damage.</summary>
+        [ThreadStatic] private static DaggerGrowthBullet _currentDagger;
+
+        private sealed class DaggerTrack
+        {
+            public uint id;
+            public DaggerGrowthBullet projectile;
+            public UnitAvatar owner;
+            public Vector2 spawnPosition;
+            public Vector2 direction;
+            public float damage;
+            public string damageId;
+            public float hitRadius;
+            public float maxTravel;
+            public float expiresAt;
+            public readonly HashSet<CombatBehaviour> attacked = new HashSet<CombatBehaviour>();
+        }
+
+        private static readonly Dictionary<uint, DaggerTrack> _daggersById = new Dictionary<uint, DaggerTrack>();
+        private static readonly Dictionary<DaggerGrowthBullet, DaggerTrack> _daggersByObject = new Dictionary<DaggerGrowthBullet, DaggerTrack>();
+        private static readonly List<DaggerTrack> _pendingDaggers = new List<DaggerTrack>();
+        private static readonly List<uint> _tmpDaggerIds = new List<uint>();
+        private static uint _nextDaggerId;
 
         // Optimistic value returned to a caller that parks its damage inside ApplyDamage (flow A
         // callers other than Bullet / MeleeCollision, which are parked and replayed whole). The
@@ -134,9 +157,167 @@ namespace ClientSideDamage
             _parked.Clear();
             _parkedDue.Clear();
             _motion.Clear();
+            _daggersById.Clear();
+            _daggersByObject.Clear();
+            _pendingDaggers.Clear();
+            _tmpDaggerIds.Clear();
+            _nextDaggerId = 0;
             _bulletReporters = 0;
-            _justParked = null; _movingBullet = null; _movingHits = 0;
+            _justParked = null; _movingBullet = null; _movingHits = 0; _currentDagger = null;
             AreaRecorder.Clear();
+        }
+
+        // ------------------------------------------------------------------ non-networked growth-parry daggers
+
+        /// <summary>
+        /// Called immediately before Charm_GrowthParry sends vanilla's RpcCreateBullet. The CSD
+        /// record therefore reaches each remote client before (or in the same reliable batch as)
+        /// the visual spawn and supplies the id that vanilla's plain MonoBehaviour does not have.
+        /// </summary>
+        public static void OnDaggerSpawn(UnitAvatar owner, DaggerGrowthBullet template, Vector2 position, Vector2 direction, float damage)
+        {
+            if (!NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value || owner == null) return;
+            uint id;
+            do { id = ++_nextDaggerId; } while (id == 0 || _daggersById.ContainsKey(id));
+
+            Vector2 dir = direction.sqrMagnitude > 0.0001f ? direction.normalized : Vector2.right;
+            DaggerTrack track = new DaggerTrack
+            {
+                id = id,
+                owner = owner,
+                spawnPosition = position,
+                direction = dir,
+                damage = damage,
+                damageId = template != null ? template.damageId : "DaggerGrowthBullet",
+                hitRadius = template != null ? template.hitRadius : 0.5f,
+                maxTravel = DaggerMaxTravel(template),
+                expiresAt = Time.time + DaggerLifetime(template),
+            };
+            _daggersById.Add(id, track);
+            _pendingDaggers.Add(track);
+
+            uint ownerNetId = owner.netId;
+            Action<NetworkWriter> payload = w =>
+            {
+                w.WriteUInt(id);
+                w.WriteUInt(ownerNetId);
+                w.WriteVector2(position);
+                w.WriteVector2(dir);
+                w.WriteFloat(damage);
+            };
+            int sent = 0;
+            foreach (ModdedClient mc in _clients.Values)
+            {
+                if (!mc.acked || (mc.features & CsdFeatures.BulletHits) == 0 || mc.avatar == null || mc.conn == null || !mc.conn.isReady) continue;
+                CsdRpc.SendToClient(mc.avatar, mc.conn, CsdRpc.DaggerSpawn, payload);
+                sent++;
+            }
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] growth dagger spawn id " + id + " owner=" + owner.name + " -> " + sent + " client(s)");
+        }
+
+        public static void OnDaggerInitialized(DaggerGrowthBullet projectile, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject)
+        {
+            if (projectile == null || !isServerObject || !NetworkServer.active) return;
+            DaggerTrack match = null;
+            for (int i = 0; i < _pendingDaggers.Count; i++)
+            {
+                DaggerTrack t = _pendingDaggers[i];
+                if (t.projectile == null && t.owner == owner && DaggerSpawnMatches(t, position, direction, damage))
+                {
+                    match = t;
+                    break;
+                }
+            }
+            if (match == null)
+            {
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] growth dagger visual had no pending spawn record");
+                return;
+            }
+            _pendingDaggers.Remove(match);
+            match.projectile = projectile;
+            match.damageId = projectile.damageId;
+            match.hitRadius = projectile.hitRadius;
+            match.maxTravel = DaggerMaxTravel(projectile);
+            match.expiresAt = Mathf.Max(match.expiresAt, Time.time + DaggerLifetime(projectile));
+            _daggersByObject[projectile] = match;
+        }
+
+        private static bool DaggerSpawnMatches(DaggerTrack t, Vector2 position, Vector2 direction, float damage)
+        {
+            if ((t.spawnPosition - position).sqrMagnitude > 0.01f) return false;
+            Vector2 dir = direction.sqrMagnitude > 0.0001f ? direction.normalized : Vector2.right;
+            if (Vector2.Dot(t.direction, dir) < 0.999f) return false;
+            return Mathf.Abs(t.damage - damage) <= Mathf.Max(0.01f, Mathf.Abs(damage) * 0.001f);
+        }
+
+        private static float DaggerMaxTravel(DaggerGrowthBullet d)
+        {
+            if (d == null) return 12f;
+            float coast = Mathf.Max(0f, d.travelDistance);
+            float stop = d.deceleration > 0.001f ? d.moveSpeed * d.moveSpeed / (2f * d.deceleration) : 6f;
+            return Mathf.Clamp(coast + stop, 1f, 30f);
+        }
+
+        private static float DaggerLifetime(DaggerGrowthBullet d)
+        {
+            if (d == null) return 8f;
+            float coast = d.moveSpeed > 0.001f ? d.travelDistance / d.moveSpeed : 0f;
+            float slow = d.deceleration > 0.001f ? d.moveSpeed / d.deceleration : 1f;
+            return Mathf.Clamp(coast + slow + d.despawnDelay + d.destroyFallbackTime + 3f, 5f, 15f);
+        }
+
+        private static void SweepDaggers(float now)
+        {
+            if (_daggersById.Count == 0) return;
+            _tmpDaggerIds.Clear();
+            foreach (KeyValuePair<uint, DaggerTrack> kv in _daggersById)
+                if (kv.Value.expiresAt <= now) _tmpDaggerIds.Add(kv.Key);
+            for (int i = 0; i < _tmpDaggerIds.Count; i++)
+            {
+                DaggerTrack t;
+                if (!_daggersById.TryGetValue(_tmpDaggerIds[i], out t)) continue;
+                _daggersById.Remove(t.id);
+                _pendingDaggers.Remove(t);
+                if (t.projectile != null) _daggersByObject.Remove(t.projectile);
+            }
+        }
+
+        public static void OnDaggerGone(DaggerGrowthBullet projectile)
+        {
+            if (projectile == null) return;
+            DaggerTrack track;
+            if (!_daggersByObject.TryGetValue(projectile, out track)) return;
+            _daggersByObject.Remove(projectile);
+            track.projectile = null;   // keep the authoritative spawn data for late reliable reports
+        }
+
+        public static DaggerGrowthBullet PushDaggerHitCheck(DaggerGrowthBullet projectile)
+        {
+            DaggerGrowthBullet previous = _currentDagger;
+            _currentDagger = projectile;
+            return previous;
+        }
+
+        public static void PopDaggerHitCheck(DaggerGrowthBullet previous)
+        {
+            _currentDagger = previous;
+        }
+
+        /// <summary>
+        /// The vanilla dagger inserts the victim into its permanent hitTargets set immediately
+        /// before ApplyDamage. Returning Fail_Absolute here consumes that host observation without
+        /// mutating health; a matching client report replays the same DamageInstance construction.
+        /// </summary>
+        public static bool TrySuppressDaggerServerDamage(UnitAvatar victim, DamageInstance damage, out EApplyDamageResult result)
+        {
+            result = EApplyDamageResult.Fail_Absolute;
+            if (ApplyDamageBypass || _currentDagger == null || damage == null || !NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value) return false;
+            DaggerTrack track;
+            if (!_daggersByObject.TryGetValue(_currentDagger, out track)) return false;
+            if (damage.origin != track.owner || damage.id != track.damageId || damage.damageType != EDamageType.Projectile || damage.fromType != EDamageFromType.DirectAttack || damage.elementalType != EDamageElementalType.Chaos) return false;
+            if (!IsClientAuthoritative(track.owner, CsdFeatures.BulletHits) && !IsClientAuthoritative(victim, CsdFeatures.BulletHits)) return false;
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] suppressed host growth dagger " + track.id + " -> " + victim.name);
+            return true;
         }
 
         /// <summary>Tells the area hit recorder which players' hits are client-verified, and counts the clients that report bullet hits.</summary>
@@ -202,7 +383,7 @@ namespace ClientSideDamage
         {
             if (!NetworkServer.active)
             {
-                if (_clients.Count > 0 || _pending.Count > 0) Reset();
+                if (_clients.Count > 0 || _pending.Count > 0 || _daggersById.Count > 0) Reset();
                 _lobbyPhase = -1;
                 _hostLinePending = false;
                 _chat.Clear();
@@ -237,6 +418,7 @@ namespace ClientSideDamage
                     for (int i = 0; i < _tmpKeys.Count; i++) _missCooldown.Remove(_tmpKeys[i]);
                 }
                 SweepMotion();
+                SweepDaggers(now);
             }
             if (!Plugin.Ready) return;   // status only; nothing else may run un-initialised
 
@@ -1541,6 +1723,76 @@ namespace ClientSideDamage
                     w.WriteUInt(bulletNetId); w.WriteUInt(victimNetId); w.WriteByte(victimComponent); w.WriteByte(code);
                 });
             }
+        }
+
+        public static void OnDaggerHit(UnitAvatar avatar, NetworkConnectionToClient sender, uint daggerId, uint victimNetId, byte victimComponent, Vector2 daggerPosition, Vector2 hitPoint, bool hasSnapshot, CombatSnapshot snap)
+        {
+            PlayerAvatar me = avatar as PlayerAvatar;
+            ModdedClient mc = GetModdedClient(me);
+            string drop = null;
+            if (mc == null || mc.conn != sender || (mc.features & CsdFeatures.BulletHits) == 0) drop = "sender not a bullet-authoritative client";
+            else if (!Plugin.HostBulletHitAuthority.Value) drop = "Host.BulletHitAuthority off";
+
+            DaggerTrack track = null;
+            CombatBehaviour victim = null;
+            UnitAvatar unit = null;
+            bool ownDagger = false, victimIsMe = false;
+            if (drop == null && (!_daggersById.TryGetValue(daggerId, out track) || track == null)) drop = "dagger id not found (already expired?)";
+            if (drop == null && track.expiresAt <= Time.time) drop = "dagger expired";
+            if (drop == null)
+            {
+                victim = CsdUtil.FindBehaviour(NetworkServer.spawned, victimNetId, victimComponent) as CombatBehaviour;
+                unit = victim as UnitAvatar;
+                ownDagger = track.owner != null && track.owner == me;
+                victimIsMe = unit != null && unit == me;
+                if (track.owner == null) drop = "dagger owner no longer exists";
+                else if (unit == null) drop = "victim not found";
+                else if (!ownDagger && !victimIsMe) drop = "neither our dagger nor us as victim";
+                else if (unit == track.owner) drop = "dagger owner reported as victim";
+                else if (unit.IsDead || !unit.gameObject.activeSelf) drop = "victim is dead or inactive";
+                else if (!CombatManager.ContainsAttackableFaction(track.owner.GetHostileFactionLayers(EDamageFromType.DirectAttack), unit.faction)) drop = "victim faction is not attackable";
+            }
+
+            // When both endpoints are modded, let the victim's own view win so its report carries
+            // the guard/dodge snapshot. The owner's copy will report the same pair as well.
+            if (drop == null && ownDagger && !victimIsMe)
+            {
+                ModdedClient victimClient = GetModdedClient(unit);
+                if (victimClient != null && (victimClient.features & CsdFeatures.BulletHits) != 0) drop = "waiting for victim's own report";
+            }
+
+            if (drop == null)
+            {
+                if (!IsFinite(daggerPosition) || !IsFinite(hitPoint)) drop = "non-finite position";
+                else
+                {
+                    Vector2 rel = daggerPosition - track.spawnPosition;
+                    float along = Vector2.Dot(rel, track.direction);
+                    float perpendicular = Mathf.Abs(rel.x * track.direction.y - rel.y * track.direction.x);
+                    float allowance = Mathf.Max(1f, track.hitRadius + 0.75f);
+                    if (along < -allowance || along > track.maxTravel + allowance || perpendicular > allowance)
+                        drop = "reported position is outside the dagger path";
+                }
+            }
+            if (drop == null && track.attacked.Contains(victim)) drop = "victim already attacked";
+
+            if (drop != null)
+            {
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] growth dagger report from conn " + (sender != null ? sender.connectionId.ToString() : "?") + " (dagger " + daggerId + " -> " + victimNetId + "/" + victimComponent + ") dropped: " + drop);
+                return;
+            }
+
+            // Vanilla adds to hitTargets before ApplyDamage and never retries this pair, including
+            // Fail_Absolute. Mirror that ordering before invoking the authoritative damage code.
+            track.attacked.Add(victim);
+            DamageInstance damage = DamageInstance.GetDamage(track.owner, track.damageId, hitPoint,
+                track.owner.GetHostileFactionLayers(EDamageFromType.DirectAttack), track.damage,
+                EDamageType.Projectile, EDamageFromType.DirectAttack, track.direction, 0, 0f);
+            damage.elementalType = EDamageElementalType.Chaos;
+
+            bool force = victimIsMe && hasSnapshot && (mc.features & CsdFeatures.DamageTakenAuthority) != 0;
+            EApplyDamageResult result = force ? ApplyWithSnapshot(me, damage, snap) : ApplyVanilla(unit, damage);
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] growth dagger " + daggerId + " -> " + victim.name + " reported by conn " + sender.connectionId + " -> " + result);
         }
 
         /// <summary>Bullet.Update's phase bookkeeping after an AttackOnServer that registered a hit.</summary>
