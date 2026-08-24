@@ -47,7 +47,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.4.0 loaded (protocol 9)
+   [Info   :Client Side Damage] Client Side Damage 1.4.1 loaded (protocol 9)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +58,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.4.0 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.4.1 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.4.0 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.4.1 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -183,6 +183,9 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   constructs vanilla's projectile/DirectAttack/Chaos `DamageInstance` from its authoritative spawn
   data. The host's own observation is suppressed only when the owner or victim has negotiated
   `BulletHits`. If both are modded, the victim's report wins so its guard/dodge snapshot is used.
+  The dagger weapon's shuriken upgrades are fast, short-lived `Bullet` prefabs; their collider is
+  swept between consecutive client positions so they cannot pass completely through a target
+  between networked transform samples.
 
 * **Melee** (`MeleeCollision`): swings are network-spawned objects with the same shape data on
   both sides and a `NetworkTransformReliable`. Right after the spawn the host sends modded clients

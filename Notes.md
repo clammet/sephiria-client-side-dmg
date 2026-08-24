@@ -1,4 +1,7 @@
 Testing notes:
+- Since 1.4.1 player `Shuriken*` bullets sweep their collider between consecutive client positions.
+  Test every dagger-to-shuriken upgrade against a stationary target, a moving target, and two lined-up
+  targets (pierce variants); each target should be hit once and contacts should follow travel order.
 - Since 1.4.0 the growth-parry `DaggerGrowthBullet` uses a CSD spawn id because vanilla creates it
   independently on every peer instead of network-spawning it. Test both directions: a joined
   player's dagger hitting a monster, and another player's dagger hitting the joined player (guard,

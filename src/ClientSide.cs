@@ -387,6 +387,7 @@ namespace ClientSideDamage
         private static readonly Dictionary<Bullet, BulletTrack> _bullets = new Dictionary<Bullet, BulletTrack>();
         private static readonly Collider2D[] _colliders = new Collider2D[16];
         private static readonly TopdownRigidbody[] _rigidbodies = new TopdownRigidbody[16];
+        private static readonly RaycastHit2D[] _bulletSweepHits = new RaycastHit2D[32];
 
         public static void OnBulletGone(Bullet b)
         {
@@ -476,7 +477,8 @@ namespace ClientSideDamage
                 }
             }
             Vector3 pos = b.transform.position;
-            Vector2 moveDir = track.hasLast ? (Vector2)(pos - track.lastPos) : Vector2.zero;
+            bool hasPreviousPos = track.hasLast;
+            Vector2 moveDir = hasPreviousPos ? (Vector2)(pos - track.lastPos) : Vector2.zero;
             track.lastPos = pos;
             track.hasLast = true;
             bool testing = b.isCollisionEnabled || Time.time < track.testUntil;
@@ -489,6 +491,10 @@ namespace ClientSideDamage
             bool own = track.relevance == BulletRelevance.Own;
 
             bool anyHit = false;
+            if (b.collisionDemension == Bullet.ECollisionDemension.Normal && hasPreviousPos && IsSweptShuriken(b))
+            {
+                anyHit |= SweepShurikenHits(b, track, me, own, pos, moveDir);
+            }
             if (b.collisionDemension == Bullet.ECollisionDemension.Ground)
             {
                 int n = TopdownSpatialHash.ColliderCastNonAlloc(b.attackingCollider, _rigidbodies);
@@ -542,10 +548,55 @@ namespace ClientSideDamage
             }
         }
 
+        /// <summary>
+        /// The dagger weapon's shuriken upgrades use very fast, short-lived UniformVector2 bullets.
+        /// A remote NetworkTransform can move one from one side of a target to the other between
+        /// rendered client frames, so an overlap at only the current position tunnels straight
+        /// through. Sweep just those player projectile prefabs across the observed interval.
+        /// </summary>
+        private static bool IsSweptShuriken(Bullet b)
+        {
+            return b.MoveModule is BulletMoveModule_UniformVector2 &&
+                   b.name != null && b.name.StartsWith("Shuriken", StringComparison.Ordinal);
+        }
+
+        private static bool SweepShurikenHits(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Vector2 currentPos, Vector2 moveDir)
+        {
+            float distance = moveDir.magnitude;
+            if (distance <= 0.001f) return false;
+
+            // Cast backwards because the collider is already at currentPos. Results are sorted
+            // farthest-first so piercing targets are reported in the projectile's travel order.
+            Vector2 backwards = -moveDir / distance;
+            int n = b.attackingCollider.Cast(backwards, R.BulletContactFilter(b), _bulletSweepHits, distance);
+            for (int i = 1; i < n; i++)
+            {
+                RaycastHit2D hit = _bulletSweepHits[i];
+                int j = i - 1;
+                while (j >= 0 && _bulletSweepHits[j].distance < hit.distance)
+                {
+                    _bulletSweepHits[j + 1] = _bulletSweepHits[j];
+                    j--;
+                }
+                _bulletSweepHits[j + 1] = hit;
+            }
+
+            bool anyHit = false;
+            for (int i = 0; i < n; i++)
+            {
+                Collider2D c = _bulletSweepHits[i].collider;
+                if (c == null) continue;
+                if (b.MoveModule != null && !b.MoveModule.ValidateCollision(c)) continue;
+                Vector2 contactPos = currentPos + backwards * _bulletSweepHits[i].distance;
+                anyHit |= ConsiderBulletHit(b, track, me, own, c.transform, contactPos, moveDir);
+            }
+            return anyHit;
+        }
+
         private static bool ConsiderBulletHit(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Transform t, Vector3 bulletPos, Vector2 moveDir)
         {
             Vector2 dir = CsdUtil.VanillaHitDirection(b, bulletPos, t.position, moveDir.normalized, true);
-            return ReportBulletHit(b, track, me, own, t, CsdUtil.BulletHitKind_Overlap, dir);
+            return ReportBulletHit(b, track, me, own, t, CsdUtil.BulletHitKind_Overlap, dir, bulletPos);
         }
 
         /// <summary>
@@ -553,7 +604,7 @@ namespace ClientSideDamage
         /// host would let it hurt, hostile bullet vs. us only), per-bullet dedupe, snapshot when we
         /// are the victim, report. Returns true when a report went out.
         /// </summary>
-        private static bool ReportBulletHit(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Transform t, byte kind, Vector2 dir)
+        private static bool ReportBulletHit(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Transform t, byte kind, Vector2 dir, Vector2 bulletPos)
         {
             CombatBehaviour cb = CsdUtil.CombatBehaviourFromCollider(t);
             if (cb == null) return false;
@@ -574,8 +625,8 @@ namespace ClientSideDamage
             uint bulletNetId = b.netId;
             uint victimNetId = cb.netId;
             byte victimComponent = (byte)cb.ComponentIndex;
-            // where we see the bullet at the moment of contact: the host rewinds its copy there before applying
-            Vector2 bulletPos = b.transform.position;
+            // where we see the bullet at contact (including an interpolated point from a sweep):
+            // the host rewinds its copy there before applying
             CombatSnapshot snap = victimIsMe ? Capture(me) : default(CombatSnapshot);
             CsdRpc.SendToServer(me, CsdRpc.BulletHit, w =>
             {
@@ -630,7 +681,7 @@ namespace ClientSideDamage
             {
                 Transform t = _rayHits[i].transform;
                 if (t == null) continue;
-                if (ReportBulletHit(b, track, me, own, t, CsdUtil.BulletHitKind_Ray, dir)) reported++;
+                if (ReportBulletHit(b, track, me, own, t, CsdUtil.BulletHitKind_Ray, dir, origin)) reported++;
             }
         }
 
