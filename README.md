@@ -47,7 +47,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.4.1 loaded (protocol 9)
+   [Info   :Client Side Damage] Client Side Damage 1.4.3 loaded (protocol 10)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +58,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.4.1 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.4.3 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.4.1 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.4.3 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -160,8 +160,8 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   itself normally while somebody who might have reported it is within reach (its speed × the round
   trip, measured from its hit volume: an enemy hitbox for a client-owned bullet, the client's own
   player for a hostile one) is frozen where it is instead (its `Update` is skipped and it registers
-  no more host hits; clients are told its collision is off and keep testing it for 0.25 s so their
-  lagging copy can still reach the target). A report arriving within the grace (2×RTT + 0.4 s,
+  no more host hits; clients are told its collision is off and keep testing it for 0.75 s so their
+  lagging copy can still reach the target). A report arriving within the grace (2×RTT + 0.9 s,
   0.45–2 s) is applied with the rewind above; without one the bullet is destroyed vanilla-style
   where it was parked, just late. Only *misses* are parked: a destroy issued because the bullet just
   hit somebody (pierce exhausted) is not, and a bullet whose destroy module carries a payload
@@ -183,9 +183,12 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   constructs vanilla's projectile/DirectAttack/Chaos `DamageInstance` from its authoritative spawn
   data. The host's own observation is suppressed only when the owner or victim has negotiated
   `BulletHits`. If both are modded, the victim's report wins so its guard/dodge snapshot is used.
-  The dagger weapon's shuriken upgrades are fast, short-lived `Bullet` prefabs; their collider is
-  swept between consecutive client positions so they cannot pass completely through a target
-  between networked transform samples.
+  Straight-moving `UniformVector2` and `Shuriken` bullets have their collider swept between
+  consecutive client positions so they cannot pass completely through a target between networked
+  transform samples. This covers the dagger weapon's shuriken upgrades and fast enemy projectiles
+  such as mole rocks, cat throwing knives / shuriken, and panther daggers.
+  Hostile bullets are classified with the `AttackableFactionLayers` stored on the projectile at
+  spawn, so monster direct attacks are not discarded by recomputing a different faction mask.
 
 * **Melee** (`MeleeCollision`): swings are network-spawned objects with the same shape data on
   both sides and a `NetworkTransformReliable`. Right after the spawn the host sends modded clients
@@ -236,13 +239,18 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   answers hit or no-hit together with its guard/dodge snapshot. A "no" drops the damage; a
   "yes" resolves it exactly like any other flow A hit. Anything the client cannot evaluate
   (no shape recorded, unknown source object, our hitbox disabled...) keeps the host's verdict,
-  so this can only ever remove hits the client did not see, never add wrong ones.
+  so the generic verifier can only remove hits the client did not see. Pentaxis's explicitly
+  validated SpinDash path below is the one client-originated boss-contact exception.
   Shapes are only anchored when they plausibly move with the object that ran the test: a
   `Collider2D.Overlap` source collider always does; a world-space query only when it is centred
   near that object (a stomp around a boss, a laser slab in front of it) and the object has a
   `NetworkTransform` at all. A telegraphed circle at the player's position or a crack the boss
   left behind stays in host world coordinates, so the caller's client-side lag (or a facing flip
-  the client has not shown yet) cannot shift or mirror it. The client also refuses an anchor that
+  the client has not shown yet) cannot shift or mirror it. Pentaxis's SpinDash is the exception to
+  the host-query-only model: its moving damage box is swept over the boss path shown on the joined
+  client and reported to the host, because verifying the host's earlier overlap cannot create the
+  later contact the client sees. The host validates the dash phase, faction, recent path, and the
+  vanilla one-hit-per-second interval before applying it. The client also refuses an anchor that
   resolves to a differently named child or that it sees more than a few units away from where the
   host had it, and falls back to the host position.
   The methods that run these tests are found at runtime: the first time a test involving a
@@ -276,7 +284,8 @@ about one round-trip late. The mod keeps the vanilla code but moves the *decisio
   or a reply. Long stalls fall under the query timeout (host-state fallback); a full disconnect
   flushes everything with host state.
 
-* Area hit verification only removes hits: the host still has to detect the hit first. With
+* Except for Pentaxis SpinDash, area hit verification only removes hits: the host still has to
+  detect the hit first. With
   `Host.AreaHitMargin` > 0 the host's area tests are widened by that many units for joined
   players, so a hit the host missed by less than the margin is still handed to the client to
   decide with the exact shape. This is off by default because a few effects keep per-victim

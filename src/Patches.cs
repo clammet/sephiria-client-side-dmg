@@ -149,6 +149,22 @@ namespace ClientSideDamage
         }
     }
 
+    // Pentaxis (Unit_LibraryGuard) moves and tests its SpinDash box only on the server. The joined
+    // client performs the corresponding test against the boss path it actually sees.
+    [HarmonyPatch(typeof(Unit_LibraryGuard), "Update")]
+    internal static class Patch_Unit_LibraryGuard_Update
+    {
+        private static void Postfix(Unit_LibraryGuard __instance)
+        {
+            try
+            {
+                if (NetworkServer.active) ServerSide.OnPentaxisUpdateHost(__instance);
+                else ClientSide.OnPentaxisUpdate(__instance);
+            }
+            catch (Exception e) { Plugin.Log.LogError("[CSD] Pentaxis spin-dash detection failed: " + e); }
+        }
+    }
+
     // host: which bullet is moving right now and whether its Move had tile contact - tells a DestroySelf
     // issued from Bullet.Update's tile loop apart from a lifetime / arrival destroy (see ServerSide.TryParkBulletDestroy)
     [HarmonyPatch(typeof(BulletMoveModule), "Move")]

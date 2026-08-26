@@ -91,6 +91,8 @@ namespace ClientSideDamage
         private static float _nextScan;
         private static float _nextAreaRefresh;
         private static readonly List<PlayerAvatar> _areaAvatars = new List<PlayerAvatar>();
+        private static readonly Dictionary<Unit_LibraryGuard, float> _pentaxisDashSeen = new Dictionary<Unit_LibraryGuard, float>();
+        private static readonly Dictionary<long, float> _pentaxisHitCooldown = new Dictionary<long, float>();
 
         private const int MaxPending = 64;
         /// <summary>After the client rejected a bullet's area shape, the same (bullet, victim) pair is not asked again for this long.</summary>
@@ -162,6 +164,8 @@ namespace ClientSideDamage
             _pendingDaggers.Clear();
             _tmpDaggerIds.Clear();
             _nextDaggerId = 0;
+            _pentaxisDashSeen.Clear();
+            _pentaxisHitCooldown.Clear();
             _bulletReporters = 0;
             _justParked = null; _movingBullet = null; _movingHits = 0; _currentDagger = null;
             AreaRecorder.Clear();
@@ -567,7 +571,7 @@ namespace ClientSideDamage
         private static int _movingHits;             // Move's tile contact count for that bullet (0 while Move is still running)
         private static int _bulletReporters;        // acked clients with BulletHits (refreshed with the area targets)
         /// <summary>How long a modded client keeps testing a bullet after we told it collision is off (its interpolated copy lags behind ours).</summary>
-        public const float ClientTestGrace = 0.25f;
+        public const float ClientTestGrace = 0.75f;
 
         private static double Rtt(ModdedClient mc) { return mc != null && mc.conn != null ? mc.conn.rtt : 0.15; }
 
@@ -1210,6 +1214,19 @@ namespace ClientSideDamage
             if (pa == null) return false;
             ModdedClient mc = GetModdedClient(pa);
             if (mc == null) return false;
+
+            // Pentaxis's SpinDash is host-simulated while the joined client sees the boss through
+            // interpolation. The host overlap therefore happens too early to be an authoritative
+            // contact test. Its client reports the later, locally observed crossing instead (the
+            // caller still receives Success so its ordinary one-hit-per-second bookkeeping runs).
+            Unit_LibraryGuard pentaxis = damage.origin as Unit_LibraryGuard;
+            if (pentaxis != null && damage.id == "SpinDash" && Plugin.HostAreaHitAuthority.Value &&
+                (mc.features & CsdFeatures.AreaHits) != 0)
+            {
+                result = PendingResult;
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] Pentaxis host overlap suppressed for " + pa.name + "; waiting for local dash contact");
+                return true;
+            }
             bool useSnapshot, areaHits;
             if (!Wanted(mc, out useSnapshot, out areaHits)) return false;
 
@@ -1597,12 +1614,26 @@ namespace ClientSideDamage
             if (b == null || !NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value) return;
             if (!b.isServer || b.netId == 0) return;
             if (_clients.Count == 0) return;
-            Action<NetworkWriter> payload = w => w.WriteBool(enabled);
+            Action<NetworkWriter> payload = w =>
+            {
+                w.WriteBool(enabled);
+                // Vanilla does not serialize this runtime field. Client-side classification and
+                // own-projectile filtering need the exact mask chosen by the authoritative spawn.
+                w.WriteLong(b.AttackableFactionLayers);
+            };
             foreach (ModdedClient mc in _clients.Values)
             {
                 if (!mc.acked || (mc.features & CsdFeatures.BulletHits) == 0 || mc.conn == null || !mc.conn.isReady) continue;
                 CsdRpc.SendToClient(b, mc.conn, CsdRpc.BulletCollision, payload);
             }
+        }
+
+        /// <summary>Remember that this boss is genuinely in its server-authoritative damage phase.</summary>
+        public static void OnPentaxisUpdateHost(Unit_LibraryGuard boss)
+        {
+            if (boss == null || !NetworkServer.active || !boss.isServer) return;
+            if (boss.currentState == Unit_LibraryGuard.EState.SpinDash && boss.spinDashSpeed > 6f)
+                _pentaxisDashSeen[boss] = Time.time;
         }
 
         public static bool ShouldSuppressBulletServerHit(Bullet b, Transform hit)
@@ -1656,6 +1687,76 @@ namespace ClientSideDamage
             if (Plugin.DebugOn && sent > 0)
                 Plugin.Debug("[CSD/host] melee spawn " + m.name + " (" + m.GetType().Name + ", netId " + m.netId + ") owner=" + (m.owner != null ? m.owner.name + " netId " + ownerNetId : "null")
                     + " client-owned=" + IsClientAuthoritative(m.owner, CsdFeatures.MeleeHits) + " -> " + sent + " client(s)");
+        }
+
+        public static void OnPentaxisHit(UnitAvatar avatar, NetworkConnectionToClient sender, uint bossNetId, Vector2 contactCenter, Vector2 direction, CombatSnapshot snap)
+        {
+            PlayerAvatar me = avatar as PlayerAvatar;
+            ModdedClient mc = GetModdedClient(me);
+            string drop = null;
+            if (mc == null || mc.conn != sender || (mc.features & CsdFeatures.AreaHits) == 0)
+                drop = "sender not an area-authoritative client";
+            else if (!Plugin.HostAreaHitAuthority.Value)
+                drop = "Host.AreaHitAuthority off";
+
+            Unit_LibraryGuard boss = null;
+            float dashSeen = -100f;
+            if (drop == null)
+            {
+                boss = CsdUtil.FindComponent<Unit_LibraryGuard>(NetworkServer.spawned, bossNetId);
+                if (boss == null || !boss.isServer || boss.IsDead || !boss.gameObject.activeSelf)
+                    drop = "Pentaxis not spawned, active, and alive";
+                else if (!_pentaxisDashSeen.TryGetValue(boss, out dashSeen) || Time.time - dashSeen > 1.25f)
+                    drop = "Pentaxis is not in (or just leaving) SpinDash damage phase";
+                else if (me == null || me.IsDead || !me.gameObject.activeSelf)
+                    drop = "victim is dead or inactive";
+                else if (!CombatManager.ContainsAttackableFaction(boss.GetHostileFactionLayers(EDamageFromType.DirectAttack), me.faction))
+                    drop = "victim faction is not attackable";
+            }
+
+            long key = boss != null && me != null ? PairKey(boss.netId, me.netId) : 0L;
+            float cooldownUntil;
+            if (drop == null && _pentaxisHitCooldown.TryGetValue(key, out cooldownUntil) && Time.time < cooldownUntil)
+                drop = "victim already hit during this interval";
+
+            if (drop == null)
+            {
+                if (!IsFinite(contactCenter) || !IsFinite(direction))
+                {
+                    drop = "non-finite contact";
+                }
+                else
+                {
+                    // The client sees this server-driven boss one interpolation buffer behind.
+                    // Bound the reported centre to the distance it can plausibly have travelled
+                    // over that buffer plus the network round trip and its own hitbox extent.
+                    float speed = Mathf.Max(6f, Mathf.Max(Mathf.Abs(boss.spinDashSpeed), Mathf.Abs(boss.spinDashMaxSpeed)));
+                    float allowance = speed * ((float)Rtt(mc) + 0.5f) + boss.spinDashCollisionSize.magnitude + 2f;
+                    allowance = Mathf.Clamp(allowance, 4f, 20f);
+                    if (((Vector2)boss.transform.position + boss.spinDashCollisionOffset - contactCenter).sqrMagnitude > allowance * allowance)
+                        drop = "reported contact is outside the recent dash path";
+                }
+            }
+
+            if (drop != null)
+            {
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/host] Pentaxis report from conn " + (sender != null ? sender.connectionId.ToString() : "?") + " dropped: " + drop);
+                return;
+            }
+
+            _pentaxisHitCooldown[key] = Time.time + 1f;
+            bool listed = false;
+            for (int i = 0; i < boss.attackedList.Count; i++)
+                if (boss.attackedList[i].combatBehaviour == me) { listed = true; break; }
+            if (!listed) boss.attackedList.Add(new Unit_LibraryGuard.Attacked { timer = 0f, combatBehaviour = me });
+
+            Vector2 hitDirection = direction.sqrMagnitude > 0.0001f ? direction.normalized : boss.spinDashDirection;
+            DamageInstance damage = DamageInstance.GetDamage(boss, "SpinDash", contactCenter,
+                boss.GetHostileFactionLayers(EDamageFromType.DirectAttack), boss.RequestStandardDamage(),
+                EDamageType.Slice, EDamageFromType.DirectAttack, hitDirection, 25, 1f);
+            bool force = (mc.features & CsdFeatures.DamageTakenAuthority) != 0;
+            EApplyDamageResult result = force ? ApplyWithSnapshot(me, damage, snap) : ApplyVanilla(me, damage);
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] Pentaxis spin dash -> " + me.name + " reported by conn " + sender.connectionId + " -> " + result);
         }
 
         public static void OnBulletHit(UnitAvatar avatar, NetworkConnectionToClient sender, uint bulletNetId, uint victimNetId, byte victimComponent, byte kind, Vector2 direction, Vector2 bulletPos, bool hasSnapshot, CombatSnapshot snap)

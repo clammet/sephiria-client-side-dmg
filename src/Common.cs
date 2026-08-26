@@ -108,6 +108,12 @@ namespace ClientSideDamage
         /// </summary>
         public static bool BulletCanHurt(Bullet b, CombatBehaviour cb)
         {
+            return BulletCanHurt(b, cb, b != null ? b.AttackableFactionLayers : 0L);
+        }
+
+        /// <summary>Client variant using the authoritative faction mask sent by the host.</summary>
+        public static bool BulletCanHurt(Bullet b, CombatBehaviour cb, long targetFactionLayers)
+        {
             if (b == null || cb == null) return false;
             if (b.ignored.Contains(cb)) return false;
             UnitAvatar owner = b.NetworkOwner;
@@ -116,7 +122,7 @@ namespace ClientSideDamage
             {
                 if (u.NetworkLeader == owner) return false;
                 if (u.followers != null && u.followers.Contains(owner)) return false;
-                if (u.monsterType != EMonsterType.Dummy && !CombatManager.ContainsAttackableFaction(b.AttackableFactionLayers, u.faction)) return false;
+                if (u.monsterType != EMonsterType.Dummy && !CombatManager.ContainsAttackableFaction(targetFactionLayers, u.faction)) return false;
             }
             return true;
         }

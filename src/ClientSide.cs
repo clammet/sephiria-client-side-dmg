@@ -90,6 +90,7 @@ namespace ClientSideDamage
             _bullets.Clear();
             _daggers.Clear();
             _melees.Clear();
+            _pentaxis.Clear();
             _queries.Clear();
             _myHitboxes = null;
             _myHitboxOwner = null;
@@ -375,6 +376,9 @@ namespace ClientSideDamage
             public bool hasLast;
             public Vector3 lastPos;
             public float testUntil;        // keep testing until then after the host switched collision off (our copy lags behind the host's)
+            public bool hasCollisionState;
+            public bool hasTargetFactions;
+            public long targetFactionLayers;   // host-only Bullet field supplied by CSD::BulletCollision
             public readonly List<Attacked> attacked = new List<Attacked>();
 
             public int IndexOf(CombatBehaviour cb)
@@ -400,15 +404,21 @@ namespace ClientSideDamage
         /// interpolated copy is still one buffer behind the host's and may not have reached the
         /// target yet, so a bullet we were testing keeps being tested for a short grace.
         /// </summary>
-        public static void OnBulletCollisionSync(Bullet b, bool enabled)
+        public static void OnBulletCollisionSync(Bullet b, bool enabled, long targetFactionLayers)
         {
             if (b == null) return;
-            if (!enabled && b.isCollisionEnabled && b.isClient && !b.isServer)
+            BulletTrack track;
+            if (!_bullets.TryGetValue(b, out track)) { track = new BulletTrack(); _bullets[b] = track; }
+            track.hasTargetFactions = true;
+            track.targetFactionLayers = targetFactionLayers;
+            // Only grant interpolation grace on a real enabled -> disabled transition. Some
+            // projectiles (notably CatShuriken) spawn collision-off while winding up; their first
+            // state sync must not create a premature damage window.
+            if (track.hasCollisionState && !enabled && b.isCollisionEnabled && b.isClient && !b.isServer)
             {
-                BulletTrack track;
-                if (!_bullets.TryGetValue(b, out track)) { track = new BulletTrack(); _bullets[b] = track; }   // parked before our first Update of it
                 track.testUntil = Time.time + ServerSide.ClientTestGrace;
             }
+            track.hasCollisionState = true;
             b.isCollisionEnabled = enabled;
         }
 
@@ -436,13 +446,17 @@ namespace ClientSideDamage
             if (track.phase == 2 && !(b.pierceCreatureCount > 0 && b.pierceCreatureCount <= track.reported)) track.phase = 0;
         }
 
-        private static BulletRelevance Classify(Bullet b, PlayerAvatar me)
+        private static BulletRelevance Classify(Bullet b, BulletTrack track, PlayerAvatar me)
         {
             if (CsdUtil.IsBulletExcluded(b)) return BulletRelevance.Ignore;
             UnitAvatar owner = b.NetworkOwner;
             if (owner != null && owner == me) return BulletRelevance.Own;
-            // somebody else's bullet: only interesting if it can hurt us at all
-            if (owner != null && !CombatManager.ContainsAttackableFaction(owner.GetHostileFactionLayers(EDamageFromType.None), me.faction)) return BulletRelevance.Ignore;
+            // AttackableFactionLayers is runtime-only in vanilla (not a SyncVar), so wait for the
+            // host's CSD spawn-state RPC instead of guessing from the owner and the wrong damage
+            // source type. That guess discarded valid cat knives / shuriken.
+            if (!track.hasTargetFactions) return BulletRelevance.Unknown;
+            if (me.monsterType != EMonsterType.Dummy &&
+                !CombatManager.ContainsAttackableFaction(track.targetFactionLayers, me.faction)) return BulletRelevance.Ignore;
             return BulletRelevance.Hostile;
         }
 
@@ -486,14 +500,15 @@ namespace ClientSideDamage
 
             PlayerAvatar me = LocalAvatar;
             if (me == null) return;
-            if (track.relevance == BulletRelevance.Unknown) track.relevance = Classify(b, me);
+            if (track.relevance == BulletRelevance.Unknown) track.relevance = Classify(b, track, me);
+            if (track.relevance == BulletRelevance.Unknown) return;   // authoritative spawn metadata has not arrived yet
             if (track.relevance == BulletRelevance.Ignore) return;
             bool own = track.relevance == BulletRelevance.Own;
 
             bool anyHit = false;
-            if (b.collisionDemension == Bullet.ECollisionDemension.Normal && hasPreviousPos && IsSweptShuriken(b))
+            if (b.collisionDemension == Bullet.ECollisionDemension.Normal && hasPreviousPos && ShouldSweepBullet(b))
             {
-                anyHit |= SweepShurikenHits(b, track, me, own, pos, moveDir);
+                anyHit |= SweepBulletHits(b, track, me, own, pos, moveDir);
             }
             if (b.collisionDemension == Bullet.ECollisionDemension.Ground)
             {
@@ -549,18 +564,18 @@ namespace ClientSideDamage
         }
 
         /// <summary>
-        /// The dagger weapon's shuriken upgrades use very fast, short-lived UniformVector2 bullets.
-        /// A remote NetworkTransform can move one from one side of a target to the other between
-        /// rendered client frames, so an overlap at only the current position tunnels straight
-        /// through. Sweep just those player projectile prefabs across the observed interval.
+        /// Straight-moving bullets can cross an entire target between remote NetworkTransform
+        /// samples. This includes player shuriken as well as enemy rocks, throwing knives and
+        /// shuriken. Sweep the movement modules whose observed path between samples is a straight
+        /// segment; curved / orbiting / returning projectiles keep their ordinary overlap test.
         /// </summary>
-        private static bool IsSweptShuriken(Bullet b)
+        private static bool ShouldSweepBullet(Bullet b)
         {
-            return b.MoveModule is BulletMoveModule_UniformVector2 &&
-                   b.name != null && b.name.StartsWith("Shuriken", StringComparison.Ordinal);
+            return b.MoveModule is BulletMoveModule_UniformVector2 ||
+                   b.MoveModule is BulletMoveModule_Shuriken;
         }
 
-        private static bool SweepShurikenHits(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Vector2 currentPos, Vector2 moveDir)
+        private static bool SweepBulletHits(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Vector2 currentPos, Vector2 moveDir)
         {
             float distance = moveDir.magnitude;
             if (distance <= 0.001f) return false;
@@ -593,6 +608,104 @@ namespace ClientSideDamage
             return anyHit;
         }
 
+        // ------------------------------------------------------------------ Pentaxis spin dash
+
+        private sealed class PentaxisTrack
+        {
+            public bool hasCenter;
+            public Vector2 lastCenter;
+            public float lastReportAt = -100f;
+        }
+
+        private static readonly Dictionary<Unit_LibraryGuard, PentaxisTrack> _pentaxis = new Dictionary<Unit_LibraryGuard, PentaxisTrack>();
+        private const float PentaxisHitInterval = 1f;   // Unit_LibraryGuard.attackedList uses the same interval
+
+        /// <summary>
+        /// Pentaxis performs its spin-dash overlap only on the host. A joined client sees the boss
+        /// one interpolation buffer later, so merely verifying the host's early overlap can reject
+        /// it without ever creating the contact the client sees later. Test the exact dash box over
+        /// the boss's observed movement and report that local contact back to the host.
+        /// </summary>
+        public static void OnPentaxisUpdate(Unit_LibraryGuard boss)
+        {
+            if (boss == null) return;
+            if (!Active || !Has(CsdFeatures.AreaHits) || !Plugin.ClientAreaHitVerification.Value)
+            {
+                _pentaxis.Remove(boss);
+                return;
+            }
+            if (!boss.isClient || boss.isServer) return;
+
+            PentaxisTrack track;
+            if (!_pentaxis.TryGetValue(boss, out track))
+            {
+                track = new PentaxisTrack();
+                _pentaxis[boss] = track;
+            }
+
+            Vector2 center = (Vector2)boss.transform.position + boss.spinDashCollisionOffset;
+            bool attacking = boss.currentState == Unit_LibraryGuard.EState.SpinDash && boss.spinDashSpeed > 6f;
+            if (!attacking)
+            {
+                track.hasCenter = false;
+                track.lastCenter = center;
+                return;
+            }
+
+            PlayerAvatar me = LocalAvatar;
+            if (me == null || me.IsDead ||
+                !CombatManager.ContainsAttackableFaction(boss.GetHostileFactionLayers(EDamageFromType.DirectAttack), me.faction))
+            {
+                track.lastCenter = center;
+                track.hasCenter = true;
+                return;
+            }
+
+            Vector2 from = track.hasCenter ? track.lastCenter : center;
+            track.lastCenter = center;
+            track.hasCenter = true;
+            if (Time.time - track.lastReportAt < PentaxisHitInterval) return;
+
+            Collider2D[] mine = MyHitboxes(me);
+            if (!PentaxisSweepTouches(from, center, boss.spinDashCollisionSize, mine)) return;
+
+            track.lastReportAt = Time.time;
+            Vector2 direction = boss.spinDashDirection.sqrMagnitude > 0.0001f ? boss.spinDashDirection.normalized : (center - from).normalized;
+            CombatSnapshot snap = Capture(me);
+            uint bossNetId = boss.netId;
+            CsdRpc.SendToServer(me, CsdRpc.PentaxisHit, w =>
+            {
+                w.WriteUInt(bossNetId);
+                w.WriteVector2(center);
+                w.WriteVector2(direction);
+                snap.Write(w);
+            });
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/client] Pentaxis spin dash -> " + me.name + " at " + center + " " + snap);
+        }
+
+        private static bool PentaxisSweepTouches(Vector2 from, Vector2 to, Vector2 size, Collider2D[] mine)
+        {
+            if (mine == null || mine.Length == 0) return false;
+            AreaShape shape = new AreaShape();
+            shape.kind = AreaShapeKind.Box;
+            shape.victim = AreaVictimTest.HitboxCollider;
+            shape.size = new Vector2(Mathf.Abs(size.x), Mathf.Abs(size.y));
+            shape.angle = 0f;
+            shape.useTriggers = true;
+            shape.useLayerMask = true;
+            shape.layerMask = CombatManager.Topdown1FLayerMask;
+
+            float distance = (to - from).magnitude;
+            float stride = Mathf.Max(0.1f, Mathf.Min(shape.size.x, shape.size.y) * 0.35f);
+            int steps = Mathf.Clamp(Mathf.CeilToInt(distance / stride), 1, 64);
+            for (int i = 0; i <= steps; i++)
+            {
+                shape.center = Vector2.Lerp(from, to, (float)i / steps);
+                if (AreaGeom.HitboxOverlaps(shape, mine)) return true;
+            }
+            return false;
+        }
+
         private static bool ConsiderBulletHit(Bullet b, BulletTrack track, PlayerAvatar me, bool own, Transform t, Vector3 bulletPos, Vector2 moveDir)
         {
             Vector2 dir = CsdUtil.VanillaHitDirection(b, bulletPos, t.position, moveDir.normalized, true);
@@ -612,7 +725,7 @@ namespace ClientSideDamage
             if (own)
             {
                 if (victimIsMe && !b.canAttackOwner) return false;
-                if (!CsdUtil.BulletCanHurt(b, cb)) return false;   // vanilla rejects these before any bookkeeping
+                if (!track.hasTargetFactions || !CsdUtil.BulletCanHurt(b, cb, track.targetFactionLayers)) return false;   // vanilla rejects these before any bookkeeping
             }
             else if (!victimIsMe)
             {
@@ -666,7 +779,8 @@ namespace ClientSideDamage
                 track = new BulletTrack();
                 _bullets[b] = track;
             }
-            if (track.relevance == BulletRelevance.Unknown) track.relevance = Classify(b, me);
+            if (track.relevance == BulletRelevance.Unknown) track.relevance = Classify(b, track, me);
+            if (track.relevance == BulletRelevance.Unknown) return;
             if (track.relevance == BulletRelevance.Ignore) return;
             bool own = track.relevance == BulletRelevance.Own;
             if (distance <= 0f) distance = 15f;

@@ -31,6 +31,7 @@ namespace ClientSideDamage
         public const string BulletHit = "CSD::BulletHit";
         public const string MeleeHit = "CSD::MeleeHit";
         public const string DaggerHit = "CSD::DaggerHit";
+        public const string PentaxisHit = "CSD::PentaxisHit";
 
         /// <summary>What the host did with a reported bullet hit (mirrors Bullet.AttackOnServer's bookkeeping).</summary>
         public const byte HitResult_NotApplied = 0;   // Fail_Absolute or never applied: vanilla would test this pair again
@@ -77,6 +78,7 @@ namespace ClientSideDamage
                 new Entry(ua, BulletHit, OnBulletHit, true),
                 new Entry(ua, MeleeHit, OnMeleeHit, true),
                 new Entry(ua, DaggerHit, OnDaggerHit, true),
+                new Entry(ua, PentaxisHit, OnPentaxisHit, true),
             };
             _ourHashes.Clear();
             for (int i = 0; i < _table.Length; i++)
@@ -184,8 +186,9 @@ namespace ClientSideDamage
             Guard("OnBulletCollision", () =>
             {
                 bool enabled = reader.ReadBool();
+                long targetFactionLayers = reader.ReadLong();
                 if (!Plugin.Ready || !NetworkClient.active || NetworkServer.active) return;
-                ClientSide.OnBulletCollisionSync(obj as Bullet, enabled);
+                ClientSide.OnBulletCollisionSync(obj as Bullet, enabled, targetFactionLayers);
             });
         }
 
@@ -318,6 +321,19 @@ namespace ClientSideDamage
                 if (hasSnapshot) snap = CombatSnapshot.Read(reader);
                 if (!Plugin.Ready || !NetworkServer.active) return;
                 ServerSide.OnDaggerHit(obj as UnitAvatar, sender, daggerId, victimNetId, victimComponent, daggerPosition, hitPoint, hasSnapshot, snap);
+            });
+        }
+
+        private static void OnPentaxisHit(NetworkBehaviour obj, NetworkReader reader, NetworkConnectionToClient sender)
+        {
+            Guard("OnPentaxisHit", () =>
+            {
+                uint bossNetId = reader.ReadUInt();
+                Vector2 contactCenter = reader.ReadVector2();
+                Vector2 direction = reader.ReadVector2();
+                CombatSnapshot snap = CombatSnapshot.Read(reader);
+                if (!Plugin.Ready || !NetworkServer.active) return;
+                ServerSide.OnPentaxisHit(obj as UnitAvatar, sender, bossNetId, contactCenter, direction, snap);
             });
         }
     }
