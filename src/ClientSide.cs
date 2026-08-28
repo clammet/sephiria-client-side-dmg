@@ -88,6 +88,7 @@ namespace ClientSideDamage
             _guardStartTime = -1f;
             _dashInvincibleUntil = -1f;
             _bullets.Clear();
+            _pendingRays = 0;
             _daggers.Clear();
             _melees.Clear();
             _pentaxis.Clear();
@@ -103,6 +104,7 @@ namespace ClientSideDamage
             if (!Plugin.Ready) return;
             if (_queries.Count > 0) AnswerQueries();
             if (_daggers.Count > 0) CleanupDaggerTracks();
+            if (_pendingRays > 0) TickPendingRays();
         }
 
         // ------------------------------------------------------------------ self status lines (local HUD log only)
@@ -365,11 +367,14 @@ namespace ClientSideDamage
         {
             public CombatBehaviour cb;
             public float timer;
+            public float retryAt;          // > 0: the host did not apply the report (Fail_Absolute); the pair may be reported again from then on
         }
 
         private class BulletTrack
         {
             public BulletRelevance relevance;
+            public bool factionFallback;   // classified without the host's faction mask (see Classify)
+            public float firstSeen;
             public int phase;
             public float phaseTimer;
             public int reported;           // reports the host has (optimistically) counted towards pierce
@@ -379,6 +384,8 @@ namespace ClientSideDamage
             public bool hasCollisionState;
             public bool hasTargetFactions;
             public long targetFactionLayers;   // host-only Bullet field supplied by CSD::BulletCollision
+            public bool hasPendingRay;     // a RaycastArrow sprite RPC arrived before the spawn state: run the ray once it is in
+            public float pendingRayDistance;
             public readonly List<Attacked> attacked = new List<Attacked>();
 
             public int IndexOf(CombatBehaviour cb)
@@ -392,10 +399,70 @@ namespace ClientSideDamage
         private static readonly Collider2D[] _colliders = new Collider2D[16];
         private static readonly TopdownRigidbody[] _rigidbodies = new TopdownRigidbody[16];
         private static readonly RaycastHit2D[] _bulletSweepHits = new RaycastHit2D[32];
+        private static readonly List<Bullet> _pendingRayTmp = new List<Bullet>();
+        private static int _pendingRays;
+
+        /// <summary>
+        /// How long a bullet waits for the host's spawn-state RPC (CSD::BulletCollision) before it
+        /// is classified without it. The RPC normally arrives in the same batch as the spawn; it is
+        /// missing for bullets that were already in flight when this client was enabled, and it
+        /// arrives late for RPCs vanilla sends from inside OnSpawnFinalized on older hosts.
+        /// </summary>
+        private const float TargetFactionWait = 0.5f;
+
+        /// <summary>
+        /// After the host answered a report with "not applied" (vanilla would test the pair again
+        /// next frame), the same pair is not reported again for this long. Vanilla's retest is a
+        /// local overlap; ours is a round trip per frame.
+        /// </summary>
+        private const float NotAppliedRetry = 0.25f;
+
+        private static BulletTrack GetTrack(Bullet b)
+        {
+            BulletTrack track;
+            if (!_bullets.TryGetValue(b, out track))
+            {
+                track = new BulletTrack { firstSeen = Time.time };
+                _bullets[b] = track;
+            }
+            return track;
+        }
 
         public static void OnBulletGone(Bullet b)
         {
-            if (b != null) _bullets.Remove(b);
+            if (b == null) return;
+            BulletTrack track;
+            if (_bullets.TryGetValue(b, out track) && track.hasPendingRay) _pendingRays--;
+            _bullets.Remove(b);
+        }
+
+        /// <summary>Hitscan arrows whose spawn state never came: run them with the fallback classification.</summary>
+        private static void TickPendingRays()
+        {
+            _pendingRayTmp.Clear();
+            foreach (KeyValuePair<Bullet, BulletTrack> kv in _bullets)
+            {
+                if (kv.Value.hasPendingRay && (kv.Value.hasTargetFactions || Time.time - kv.Value.firstSeen >= TargetFactionWait)) _pendingRayTmp.Add(kv.Key);
+            }
+            for (int i = 0; i < _pendingRayTmp.Count; i++)
+            {
+                Bullet b = _pendingRayTmp[i];
+                BulletTrack track;
+                if (b == null || !_bullets.TryGetValue(b, out track)) continue;
+                RunPendingRay(b, track);
+            }
+            _pendingRayTmp.Clear();
+        }
+
+        private static void RunPendingRay(Bullet b, BulletTrack track)
+        {
+            if (!track.hasPendingRay) return;
+            track.hasPendingRay = false;
+            _pendingRays--;
+            BulletMoveModule_RaycastArrow arrow = b.MoveModule as BulletMoveModule_RaycastArrow;
+            if (arrow == null) return;
+            try { OnRaycastArrowSprite(arrow, track.pendingRayDistance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/client] deferred hitscan detection failed: " + e); }
         }
 
         /// <summary>
@@ -407,10 +474,11 @@ namespace ClientSideDamage
         public static void OnBulletCollisionSync(Bullet b, bool enabled, long targetFactionLayers)
         {
             if (b == null) return;
-            BulletTrack track;
-            if (!_bullets.TryGetValue(b, out track)) { track = new BulletTrack(); _bullets[b] = track; }
+            BulletTrack track = GetTrack(b);
             track.hasTargetFactions = true;
             track.targetFactionLayers = targetFactionLayers;
+            // classified without the mask while waiting for it: redo that with the real one
+            if (track.factionFallback) { track.factionFallback = false; track.relevance = BulletRelevance.Unknown; }
             // Only grant interpolation grace on a real enabled -> disabled transition. Some
             // projectiles (notably CatShuriken) spawn collision-off while winding up; their first
             // state sync must not create a premature damage window.
@@ -420,6 +488,7 @@ namespace ClientSideDamage
             }
             track.hasCollisionState = true;
             b.isCollisionEnabled = enabled;
+            if (track.hasPendingRay) RunPendingRay(b, track);
         }
 
         /// <summary>
@@ -439,8 +508,14 @@ namespace ClientSideDamage
             if (cb == null) return;
             if (code == CsdRpc.HitResult_NotApplied)
             {
+                // vanilla would retest the pair next frame; we retry after a short cooldown
                 int i = track.IndexOf(cb);
-                if (i >= 0) track.attacked.RemoveAt(i);
+                if (i >= 0)
+                {
+                    Attacked a = track.attacked[i];
+                    a.retryAt = Time.time + NotAppliedRetry;
+                    track.attacked[i] = a;
+                }
             }
             if (track.reported > 0) track.reported--;
             if (track.phase == 2 && !(b.pierceCreatureCount > 0 && b.pierceCreatureCount <= track.reported)) track.phase = 0;
@@ -454,7 +529,16 @@ namespace ClientSideDamage
             // AttackableFactionLayers is runtime-only in vanilla (not a SyncVar), so wait for the
             // host's CSD spawn-state RPC instead of guessing from the owner and the wrong damage
             // source type. That guess discarded valid cat knives / shuriken.
-            if (!track.hasTargetFactions) return BulletRelevance.Unknown;
+            if (!track.hasTargetFactions)
+            {
+                if (Time.time - track.firstSeen < TargetFactionWait) return BulletRelevance.Unknown;
+                // No spawn state after the wait (bullet already in flight when we were enabled, or
+                // an older host): assume it can hurt us. The host still applies its own faction
+                // test to every report, so a wrong guess costs a rejected report, never a wrong hit.
+                track.factionFallback = true;
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/client] bullet " + b.name + " (netId " + b.netId + ") has no spawn state from the host after " + TargetFactionWait + "s, treating it as hostile");
+                return BulletRelevance.Hostile;
+            }
             if (me.monsterType != EMonsterType.Dummy &&
                 !CombatManager.ContainsAttackableFaction(track.targetFactionLayers, me.faction)) return BulletRelevance.Ignore;
             return BulletRelevance.Hostile;
@@ -467,12 +551,7 @@ namespace ClientSideDamage
             // cheapest gates first: most bullets on screen cannot collide right now
             if (b.collosionType == Bullet.ECollisionTiming.None) return;
 
-            BulletTrack track;
-            if (!_bullets.TryGetValue(b, out track))
-            {
-                track = new BulletTrack();
-                _bullets[b] = track;
-            }
+            BulletTrack track = GetTrack(b);
             float dt = Time.deltaTime;
             // vanilla ticks the phase-1 cooldown whenever it is not testing, collision enabled or not
             if (track.phase == 1)
@@ -725,14 +804,27 @@ namespace ClientSideDamage
             if (own)
             {
                 if (victimIsMe && !b.canAttackOwner) return false;
-                if (!track.hasTargetFactions || !CsdUtil.BulletCanHurt(b, cb, track.targetFactionLayers)) return false;   // vanilla rejects these before any bookkeeping
+                // vanilla rejects these before any bookkeeping; without the host's faction mask
+                // (see Classify) the faction part is left to the host
+                if (!CsdUtil.BulletCanHurt(b, cb, track.targetFactionLayers, track.hasTargetFactions)) return false;
             }
             else if (!victimIsMe)
             {
                 return false;
             }
-            if (track.IndexOf(cb) >= 0) return false;
-            track.attacked.Add(new Attacked { cb = cb, timer = b.collisionStayDamageIntervalTimer.time });
+            int existing = track.IndexOf(cb);
+            if (existing >= 0)
+            {
+                Attacked prev = track.attacked[existing];
+                if (prev.retryAt <= 0f || Time.time < prev.retryAt) return false;   // reported and pending / applied, or in the retry cooldown
+                prev.retryAt = 0f;
+                prev.timer = b.collisionStayDamageIntervalTimer.time;
+                track.attacked[existing] = prev;
+            }
+            else
+            {
+                track.attacked.Add(new Attacked { cb = cb, timer = b.collisionStayDamageIntervalTimer.time });
+            }
             track.reported++;
 
             uint bulletNetId = b.netId;
@@ -773,14 +865,17 @@ namespace ClientSideDamage
             PlayerAvatar me = LocalAvatar;
             if (me == null) return;
 
-            BulletTrack track;
-            if (!_bullets.TryGetValue(b, out track))
-            {
-                track = new BulletTrack();
-                _bullets[b] = track;
-            }
+            BulletTrack track = GetTrack(b);
             if (track.relevance == BulletRelevance.Unknown) track.relevance = Classify(b, track, me);
-            if (track.relevance == BulletRelevance.Unknown) return;
+            if (track.relevance == BulletRelevance.Unknown)
+            {
+                // Vanilla sends RpcSetSprite from OnSpawnFinalized, i.e. before a host that syncs
+                // the spawn state from a postfix gets to send it: keep the ray until the state is in
+                // (OnBulletCollisionSync) or the wait runs out (TickPendingRays).
+                if (!track.hasPendingRay) { track.hasPendingRay = true; _pendingRays++; }
+                track.pendingRayDistance = distance;
+                return;
+            }
             if (track.relevance == BulletRelevance.Ignore) return;
             bool own = track.relevance == BulletRelevance.Own;
             if (distance <= 0f) distance = 15f;
@@ -1088,22 +1183,19 @@ namespace ClientSideDamage
             UnitAvatar owner = track.owner;
             if (track.ownSwing && owner == null) { _melees.Remove(m); return; }
 
-            // The host keeps our own swings alive past their duration so that our (round-trip late)
-            // reports still find them; the hit window itself must stay vanilla's, so we test only
-            // for the swing's nominal duration (the same durationTimer vanilla runs on the host,
-            // counted from the moment we saw the swing).
-            if (track.ownSwing)
+            // The host keeps swings alive past their duration so that our (round-trip late)
+            // reports still find them - our own swings and swings that can hit us; the hit window
+            // itself must stay vanilla's, so we test only for the swing's nominal duration (the
+            // same durationTimer vanilla runs on the host, counted from the moment we saw the swing).
+            if (track.expired) return;
+            float life = m.durationTimer != null ? m.durationTimer.time : 0.33f;
+            if (track.age >= life)
             {
-                if (track.expired) return;
-                float life = m.durationTimer != null ? m.durationTimer.time : 0.33f;
-                if (track.age >= life)
-                {
-                    track.expired = true;
-                    if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee " + m.name + " (ours) done after " + track.frames + " frames / " + track.age.ToString("0.000") + "s (duration " + life.ToString("0.000") + "s), found " + track.found + " collider(s) in total");
-                    return;
-                }
-                track.age += Time.deltaTime;
+                track.expired = true;
+                if (Plugin.DebugOn) Plugin.Debug("[CSD/client] melee " + m.name + (track.ownSwing ? " (ours)" : " (hostile)") + " done after " + track.frames + " frames / " + track.age.ToString("0.000") + "s (duration " + life.ToString("0.000") + "s), found " + track.found + " collider(s) in total");
+                return;
             }
+            track.age += Time.deltaTime;
 
             if (track.ownSwing && m.attachOwnerPosition)
             {

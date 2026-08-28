@@ -114,6 +114,17 @@ namespace ClientSideDamage
         /// <summary>Client variant using the authoritative faction mask sent by the host.</summary>
         public static bool BulletCanHurt(Bullet b, CombatBehaviour cb, long targetFactionLayers)
         {
+            return BulletCanHurt(b, cb, targetFactionLayers, true);
+        }
+
+        /// <summary>
+        /// <paramref name="checkFaction"/> false: the client does not know the host's faction mask
+        /// (Bullet.AttackableFactionLayers is not synced by vanilla and the mod's spawn-state RPC
+        /// has not arrived); only the checks that need no host data are made, the host's own
+        /// ApplyDamage rejects a wrong-faction pair anyway (Fail_Absolute, nothing is consumed).
+        /// </summary>
+        public static bool BulletCanHurt(Bullet b, CombatBehaviour cb, long targetFactionLayers, bool checkFaction)
+        {
             if (b == null || cb == null) return false;
             if (b.ignored.Contains(cb)) return false;
             UnitAvatar owner = b.NetworkOwner;
@@ -122,7 +133,7 @@ namespace ClientSideDamage
             {
                 if (u.NetworkLeader == owner) return false;
                 if (u.followers != null && u.followers.Contains(owner)) return false;
-                if (u.monsterType != EMonsterType.Dummy && !CombatManager.ContainsAttackableFaction(targetFactionLayers, u.faction)) return false;
+                if (checkFaction && u.monsterType != EMonsterType.Dummy && !CombatManager.ContainsAttackableFaction(targetFactionLayers, u.faction)) return false;
             }
             return true;
         }

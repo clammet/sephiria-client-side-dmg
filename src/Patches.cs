@@ -212,10 +212,18 @@ namespace ClientSideDamage
     [HarmonyPatch(typeof(Bullet), "OnSpawnFinalized")]
     internal static class Patch_Bullet_OnSpawnFinalized
     {
+        // prefix: before the move / destroy modules send their own spawn RPCs (see ServerSide.OnBulletSpawnFinalizing)
+        private static void Prefix(Bullet __instance)
+        {
+            if (!NetworkServer.active) return;
+            try { ServerSide.OnBulletSpawnFinalizing(__instance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet collision sync failed: " + e); }
+        }
+
         private static void Postfix(Bullet __instance)
         {
             if (!NetworkServer.active) return;
-            try { ServerSide.SyncBulletCollisionState(__instance); }
+            try { ServerSide.OnBulletSpawnFinalized(__instance); }
             catch (Exception e) { Plugin.Log.LogError("[CSD/host] bullet collision sync failed: " + e); }
         }
     }

@@ -166,6 +166,7 @@ namespace ClientSideDamage
             _nextDaggerId = 0;
             _pentaxisDashSeen.Clear();
             _pentaxisHitCooldown.Clear();
+            _spawnSyncSent.Clear();
             _bulletReporters = 0;
             _justParked = null; _movingBullet = null; _movingHits = 0; _currentDagger = null;
             AreaRecorder.Clear();
@@ -328,14 +329,16 @@ namespace ClientSideDamage
         private static void RefreshAreaTargets()
         {
             _areaAvatars.Clear();
-            int reporters = 0;
+            int reporters = 0, meleeReporters = 0;
             foreach (ModdedClient mc in _clients.Values)
             {
                 if (!mc.acked || mc.avatar == null) continue;
                 if ((mc.features & CsdFeatures.BulletHits) != 0) reporters++;
+                if ((mc.features & CsdFeatures.MeleeHits) != 0) meleeReporters++;
                 if ((mc.features & CsdFeatures.AreaHits) != 0) _areaAvatars.Add(mc.avatar);
             }
             _bulletReporters = reporters;
+            _meleeReporters = meleeReporters;
             AreaRecorder.Refresh(_areaAvatars);
         }
 
@@ -479,22 +482,57 @@ namespace ClientSideDamage
             return Mathf.Clamp((float)rtt * 2f + 0.15f, 0.3f, 2f);
         }
 
-        /// <summary>MeleeCollision.DestroySelf prefix: true = keep the swing for now (destroyed from Tick later).</summary>
+        private static int _meleeReporters;   // acked clients with MeleeHits (refreshed with the area targets)
+
+        /// <summary>
+        /// MeleeCollision.DestroySelf prefix: true = keep the swing for now (destroyed from Tick later).
+        /// Lingers a swing performed by a modded client (its reports of its own hits are on the way)
+        /// and a swing that can hit a modded client (that client registers the hit against itself,
+        /// see ShouldSuppressMeleeServerHit; its report is on the way too). A lingering swing's
+        /// nominal life is over: the host registers nothing more for it, only late reports apply.
+        /// </summary>
         public static bool TryDeferMeleeDestroy(MeleeCollision m, bool forceDestroy)
         {
             if (forceDestroy || m == null || !NetworkServer.active || !Plugin.On || !Plugin.HostMeleeHitAuthority.Value) return false;
             if (!m.isServer || m.netId == 0 || !CsdUtil.IsBaseMeleeUpdate(m)) return false;
-            ModdedClient mc = GetModdedClient(m.owner);
-            if (mc == null || (mc.features & CsdFeatures.MeleeHits) == 0) return false;
             for (int i = 0; i < _lingering.Count; i++)
             {
                 if (!ReferenceEquals(_lingering[i].melee, m)) continue;
                 return Time.time < _lingering[i].destroyAt;   // durationTimer fired again while lingering
             }
-            float grace = ReportGrace(mc);
+            float grace = 0f;
+            string why = null;
+            ModdedClient owner = GetModdedClient(m.owner);
+            if (owner != null && (owner.features & CsdFeatures.MeleeHits) != 0)
+            {
+                grace = ReportGrace(owner);
+                why = "swing of conn " + owner.conn.connectionId;
+            }
+            else if (_meleeReporters > 0)
+            {
+                // somebody else's swing: a modded player it could hit registers the hit itself
+                foreach (ModdedClient mc in _clients.Values)
+                {
+                    if (!mc.acked || (mc.features & CsdFeatures.MeleeHits) == 0 || mc.avatar == null || mc.avatar.IsDead) continue;
+                    if (m.owner != null && mc.avatar == m.owner) continue;
+                    if (mc.avatar.monsterType != EMonsterType.Dummy && !CombatManager.ContainsAttackableFaction(m.targetTeam, mc.avatar.faction)) continue;
+                    List<CombatBehaviour> inSwing = R.MeleeAttackedInSwing(m);
+                    if (inSwing != null && inSwing.Contains(mc.avatar) && m.multiHit <= 1) continue;   // already resolved for this victim
+                    float g = ReportGrace(mc);
+                    if (g > grace) { grace = g; why = "may hit conn " + mc.conn.connectionId; }
+                }
+            }
+            if (grace <= 0f) return false;
             _lingering.Add(new LingeringMelee { melee = m, destroyAt = Time.time + grace });
-            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] melee " + m.name + " (netId " + m.netId + ") of conn " + mc.conn.connectionId + " lingers " + grace.ToString("0.00") + "s for late reports (rtt " + (mc.conn.rtt * 1000.0).ToString("0") + " ms)");
+            if (Plugin.DebugOn) Plugin.Debug("[CSD/host] melee " + m.name + " (netId " + m.netId + ", " + why + ") lingers " + grace.ToString("0.00") + "s for late reports");
             return true;
+        }
+
+        /// <summary>A swing kept alive past its duration for late client reports.</summary>
+        private static bool IsLingering(MeleeCollision m)
+        {
+            for (int i = 0; i < _lingering.Count; i++) if (ReferenceEquals(_lingering[i].melee, m)) return true;
+            return false;
         }
 
         private static readonly List<MeleeCollision> _lingeringDue = new List<MeleeCollision>();
@@ -1609,6 +1647,31 @@ namespace ClientSideDamage
             SyncBulletCollisionState(b, b.isCollisionEnabled && !IsParked(b));
         }
 
+        // The spawn state is sent from a prefix of Bullet.OnSpawnFinalized so that it precedes the
+        // RPCs vanilla move modules send from inside OnSpawnFinalized (RaycastArrow.RpcSetSprite is
+        // the moment the client runs its hitscan and needs the state). The postfix only sends
+        // again when OnSpawnFinalized changed the collision flag (laser warm-up and the like).
+        private static readonly Dictionary<Bullet, bool> _spawnSyncSent = new Dictionary<Bullet, bool>();
+
+        public static void OnBulletSpawnFinalizing(Bullet b)
+        {
+            if (b == null) return;
+            bool state = b.isCollisionEnabled && !IsParked(b);
+            _spawnSyncSent[b] = state;
+            SyncBulletCollisionState(b, state);
+        }
+
+        public static void OnBulletSpawnFinalized(Bullet b)
+        {
+            if (b == null) return;
+            bool state = b.isCollisionEnabled && !IsParked(b);
+            bool sent;
+            bool had = _spawnSyncSent.TryGetValue(b, out sent);
+            _spawnSyncSent.Remove(b);
+            if (had && sent == state) return;
+            SyncBulletCollisionState(b, state);
+        }
+
         public static void SyncBulletCollisionState(Bullet b, bool enabled)
         {
             if (b == null || !NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value) return;
@@ -1651,6 +1714,7 @@ namespace ClientSideDamage
             if (ProjectileBypass || m == null || !Plugin.On || !Plugin.HostMeleeHitAuthority.Value) return false;
             if (!CsdUtil.IsBaseMeleeUpdate(m)) return false;
             if (IsClientAuthoritative(m.owner, CsdFeatures.MeleeHits)) return true;
+            if (_lingering.Count > 0 && IsLingering(m)) return true;   // past its duration: only late client reports may still land
             CombatBehaviour victim = CsdUtil.CombatBehaviourFromCollider(hitTransform);
             if (victim != null && IsClientAuthoritative(victim as UnitAvatar, CsdFeatures.MeleeHits)) return true;
             return false;
