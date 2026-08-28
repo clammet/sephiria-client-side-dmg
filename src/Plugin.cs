@@ -151,16 +151,12 @@ namespace ClientSideDamage
         {
             // ServerSide.Tick runs even when not Ready (it then only announces the mod status to
             // joining players); everything else needs a fully initialised mod
-            try
-            {
-                Diagnostics.Tick();
-                ServerSide.Tick();
-                ClientSide.Tick();   // status lines only while not Ready
-            }
-            catch (Exception e)
-            {
-                Log.LogError("Tick error: " + e);
-            }
+            try { Diagnostics.Tick(); }
+            catch (Exception e) { Log.LogError("Diagnostics tick error: " + e); }
+            try { ServerSide.Tick(); }
+            catch (Exception e) { Log.LogError("Host tick error: " + e); }
+            try { ClientSide.Tick(); }   // status lines only while not Ready
+            catch (Exception e) { Log.LogError("Client tick error: " + e); }
         }
 
         /// <summary>Detected after start-up (a game RPC registered later collided with one of ours): go dormant.</summary>

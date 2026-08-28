@@ -165,14 +165,21 @@ namespace ClientSideDamage
         public static void OnHello(UnitAvatar avatar, int protocol, CsdFeatures hostFeatures)
         {
             if (NetworkServer.active) return; // host talking to itself, never happens but be safe
+            if (avatar == null || !avatar.isOwned) return;
             if (protocol != Plugin.PROTOCOL_VERSION)
             {
-                Plugin.Log.LogWarning("[CSD/client] host runs protocol " + protocol + " but we run " + Plugin.PROTOCOL_VERSION + " - mod stays off for this session.");
-                _hostSilenceAnnounced = true;
-                SelfLine("mod version mismatch (host protocol " + protocol + ", yours " + Plugin.PROTOCOL_VERSION + ") - update both");
+                if (!_helloReceived)
+                {
+                    Plugin.Log.LogWarning("[CSD/client] host runs protocol " + protocol + " but we run " + Plugin.PROTOCOL_VERSION + " - mod stays off for this session.");
+                    _hostSilenceAnnounced = true;
+                    SelfLine("mod version mismatch (host protocol " + protocol + ", yours " + Plugin.PROTOCOL_VERSION + ") - update both");
+                }
+                _helloReceived = true;
+                // still answer (the hello / ack header has not changed across protocols): the host
+                // then announces the mismatch instead of "mod not detected" and stops hailing us
+                CsdRpc.SendToServer(avatar, CsdRpc.HelloAck, w => { w.WriteInt(Plugin.PROTOCOL_VERSION); w.WriteByte((byte)CsdFeatures.None); });
                 return;
             }
-            if (avatar == null || !avatar.isOwned) return;
             _helloReceived = true;
             _hostFeatures = hostFeatures;
             PlayerAvatar pa = avatar as PlayerAvatar;
@@ -1201,7 +1208,7 @@ namespace ClientSideDamage
             {
                 m.transform.position = owner.transform.position + AttachOffset(track, owner);
             }
-            if (track.hitCount < m.multiHit)
+            if (track.hitCount < m.multiHit && m.multiHitIntervalTimer != null)
             {
                 track.multiHitTimer += Time.deltaTime;
                 if (track.multiHitTimer >= m.multiHitIntervalTimer.time)

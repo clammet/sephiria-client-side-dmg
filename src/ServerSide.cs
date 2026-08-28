@@ -426,6 +426,7 @@ namespace ClientSideDamage
                 }
                 SweepMotion();
                 SweepDaggers(now);
+                SweepPentaxis(now);
             }
             if (!Plugin.Ready) return;   // status only; nothing else may run un-initialised
 
@@ -910,11 +911,18 @@ namespace ClientSideDamage
             PlayerAvatar pa = avatar as PlayerAvatar;
             if (protocol != Plugin.PROTOCOL_VERSION)
             {
+                ModdedClient mm = Track(sender, pa);
+                if (mm != null)
+                {
+                    if (mm.announced && mm.helloAttempts >= 8) return;   // already reported for this handshake
+                    mm.announced = true;
+                    mm.helloAttempts = 8;   // stop hailing: the answer will not change
+                }
                 Plugin.Log.LogWarning("[CSD/host] client " + sender.connectionId + " runs protocol " + protocol + " but we run " + Plugin.PROTOCOL_VERSION + " - mod stays off for that player.");
-                ModdedClient mm; _clients.TryGetValue(sender.connectionId, out mm);
                 AnnouncePlayer(mm, pa, sender, "OFF - mod version mismatch (host protocol " + Plugin.PROTOCOL_VERSION + ", theirs " + protocol + ") - update both");
                 return;
             }
+            if (pa == null) return;   // the command must come from the player's own avatar
             ModdedClient mc = Track(sender, pa);
             if (mc == null) return;
             mc.acked = true;
@@ -1040,7 +1048,7 @@ namespace ClientSideDamage
         /// <summary>A joining player gets told right away when the host side cannot do anything for them.</summary>
         private static void AnnounceIfHostOff(ModdedClient mc)
         {
-            if (Plugin.On && HostFeatures() != CsdFeatures.None) return;   // handshake will announce
+            if (Plugin.On) return;   // handshake will announce (including "all host features off")
             mc.announced = true;
             AnnouncePlayer(mc, "OFF - " + HostOffReason());
         }
@@ -1156,6 +1164,9 @@ namespace ClientSideDamage
             if (conn == null || conn == NetworkServer.localConnection) return null;
             ModdedClient mc;
             if (!_clients.TryGetValue(conn.connectionId, out mc) || !mc.acked || mc.features == CsdFeatures.None) return null;
+            // not ready (scene change in progress): Mirror drops every RPC to it and it reports nothing,
+            // so the host must keep resolving its hits itself for the time being
+            if (mc.conn == null || !mc.conn.isReady) return null;
             return mc;
         }
 
@@ -1180,7 +1191,7 @@ namespace ClientSideDamage
             if (attacker != null)
             {
                 if (pa.NetworkLeader == attacker) return false;
-                if (pa.followers.Contains(attacker)) return false;
+                if (pa.followers != null && pa.followers.Contains(attacker)) return false;
                 if (pa.monsterType != EMonsterType.Dummy && !CombatManager.ContainsAttackableFaction(targetFactionLayers, pa.faction)) return false;
             }
             // A protection point is a consumable shield: vanilla would spend it on this hit. When
@@ -1688,6 +1699,27 @@ namespace ClientSideDamage
             {
                 if (!mc.acked || (mc.features & CsdFeatures.BulletHits) == 0 || mc.conn == null || !mc.conn.isReady) continue;
                 CsdRpc.SendToClient(b, mc.conn, CsdRpc.BulletCollision, payload);
+            }
+        }
+
+        private static readonly List<Unit_LibraryGuard> _pentaxisTmp = new List<Unit_LibraryGuard>();
+
+        /// <summary>Forget dash sightings of bosses that are gone or long out of their dash, and expired hit cooldowns.</summary>
+        private static void SweepPentaxis(float now)
+        {
+            if (_pentaxisDashSeen.Count > 0)
+            {
+                _pentaxisTmp.Clear();
+                foreach (KeyValuePair<Unit_LibraryGuard, float> kv in _pentaxisDashSeen)
+                    if (kv.Key == null || now - kv.Value > 10f) _pentaxisTmp.Add(kv.Key);
+                for (int i = 0; i < _pentaxisTmp.Count; i++) _pentaxisDashSeen.Remove(_pentaxisTmp[i]);
+                _pentaxisTmp.Clear();
+            }
+            if (_pentaxisHitCooldown.Count > 0)
+            {
+                _tmpKeys.Clear();
+                foreach (KeyValuePair<long, float> kv in _pentaxisHitCooldown) if (kv.Value <= now) _tmpKeys.Add(kv.Key);
+                for (int i = 0; i < _tmpKeys.Count; i++) _pentaxisHitCooldown.Remove(_tmpKeys[i]);
             }
         }
 

@@ -582,16 +582,21 @@ namespace ClientSideDamage
             get { return _stack.Count > 0 && _frame == Time.frameCount ? _stack[_stack.Count - 1].method : null; }
         }
 
-        public static void Prefix(object __instance, MethodBase __originalMethod)
+        // __state: true when this call pushed a frame. A prefix of another patch on the same
+        // method that skips the original (the parked-bullet Bullet.Update prefix) also skips
+        // the prefixes after it, but finalizers still run - without the flag such a call would
+        // pop somebody else's frame.
+        public static void Prefix(object __instance, MethodBase __originalMethod, out bool __state)
         {
             int f = Time.frameCount;
             if (f != _frame) { _stack.Clear(); _frame = f; }   // safety net: never carry entries across frames
             _stack.Add(new Frame { instance = Resolve(__instance), method = __originalMethod });
+            __state = true;
         }
 
-        public static void Finalizer()
+        public static void Finalizer(bool __state)
         {
-            if (_stack.Count > 0 && _frame == Time.frameCount) _stack.RemoveAt(_stack.Count - 1);
+            if (__state && _stack.Count > 0 && _frame == Time.frameCount) _stack.RemoveAt(_stack.Count - 1);
         }
 
         /// <summary>Compiler generated coroutine / closure objects carry the real instance in "&lt;&gt;4__this".</summary>
