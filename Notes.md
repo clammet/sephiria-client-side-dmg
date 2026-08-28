@@ -1,4 +1,12 @@
 Testing notes:
+- Since 1.4.6 hostile attached swings whose prefab has no NetworkTransform follow the owner on the
+  joined client (the same attach offset the host sends) instead of staying at the spawn point. In
+  the assets that is exactly the Library DemonBook's `CMelee_LibraryDemonBook_Move` (3000 s life),
+  `CMelee_LibraryDemonBook_PackmanMove` and `CMelee_DemonBookJumpAttack_Stamp`; every other melee
+  prefab carries one. Before, a joined player was never hit by a dashing book (the host stops testing
+  that pair, the client's copy of the swing never moved). The host player was never affected: host
+  side tests for the host's own avatar are untouched. Test: Library floors, DemonBook dash / pacman
+  charge / jump stamp against a joined player (each contact once, guard and dodge honoured).
 - 1.4.2 was the last build installed on the dev machine; 1.4.3 was never built or played. In 1.4.2
   a joined player's own bullets could not hit anything (the client filtered them with
   `Bullet.AttackableFactionLayers`, which is 0 on clients), which is the "my projectiles deal no

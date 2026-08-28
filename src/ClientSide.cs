@@ -1096,6 +1096,7 @@ namespace ClientSideDamage
         {
             public UnitAvatar owner;
             public bool ownSwing;          // our swing (attach to our local position) vs. an enemy swing against us (use synced transform)
+            public bool anchorToOwner;     // hostile attached swing without a NetworkTransform: follow the owner we see (see OnMeleeSpawned)
             public Vector3 offset;         // vanilla's offsetFromAvatarPosition, as computed by the host
             public float attachedDirection;
             public float multiHitTimer;
@@ -1166,11 +1167,18 @@ namespace ClientSideDamage
             m.motionDataBegin = begin;
             m.motionDataEnd = end;
             m.height = height;
-            if (own)
+            // A hostile swing normally keeps the transform the host streams. A few enemy swing
+            // prefabs (the Library DemonBook's dash / pacman-move / stamp volumes) carry no
+            // NetworkTransform at all: vanilla moves them only in a server-side LateUpdate, so on
+            // a client they stay at the spawn point for their whole life while the book flies on.
+            // Those follow the owner we see, with the host's own attach offset - like our own swings.
+            track.anchorToOwner = !own && owner != null && m.attachOwnerPosition && m.GetComponent<NetworkTransformBase>() == null;
+            if (own || track.anchorToOwner)
             {
                 m.transform.eulerAngles = new Vector3(0f, 0f, HorayUtility.GetAngle(end, begin));
                 if (m.attachOwnerPosition) m.transform.position = owner.transform.position + AttachOffset(track, owner);
                 else m.transform.position = begin;
+                if (track.anchorToOwner && Plugin.DebugOn) Plugin.Debug("[CSD/client] melee " + m.name + " has no NetworkTransform: anchored to " + owner.name);
             }
         }
 
@@ -1188,7 +1196,7 @@ namespace ClientSideDamage
             PlayerAvatar me = LocalAvatar;
             if (me == null) { _melees.Remove(m); return; }
             UnitAvatar owner = track.owner;
-            if (track.ownSwing && owner == null) { _melees.Remove(m); return; }
+            if ((track.ownSwing || track.anchorToOwner) && owner == null) { _melees.Remove(m); return; }
 
             // The host keeps swings alive past their duration so that our (round-trip late)
             // reports still find them - our own swings and swings that can hit us; the hit window
@@ -1204,7 +1212,7 @@ namespace ClientSideDamage
             }
             track.age += Time.deltaTime;
 
-            if (track.ownSwing && m.attachOwnerPosition)
+            if ((track.ownSwing || track.anchorToOwner) && m.attachOwnerPosition)
             {
                 m.transform.position = owner.transform.position + AttachOffset(track, owner);
             }
