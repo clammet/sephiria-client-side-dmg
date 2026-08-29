@@ -35,6 +35,9 @@ namespace ClientSideDamage
         public static readonly AccessTools.FieldRef<Bullet, EDamageElementalType> BulletElementalType = F<Bullet, EDamageElementalType>("elementalType");
         public static readonly AccessTools.FieldRef<Bullet, Timer> BulletCollisionCheckTimer = F<Bullet, Timer>("collisionCheckTimer");
 
+        // ---- Unit_ChakramThrower
+        public static readonly AccessTools.FieldRef<Unit_ChakramThrower, List<GameObject>> ChakramList = F<Unit_ChakramThrower, List<GameObject>>("chakrams");
+
         // ---- MeleeCollision
         public static readonly AccessTools.FieldRef<MeleeCollision, float> MeleeAttachedDirection = F<MeleeCollision, float>("attachedDirection");
         public static readonly AccessTools.FieldRef<MeleeCollision, Vector3> MeleeOffsetFromAvatar = F<MeleeCollision, Vector3>("offsetFromAvatarPosition");

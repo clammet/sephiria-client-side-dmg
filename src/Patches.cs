@@ -178,6 +178,17 @@ namespace ClientSideDamage
         }
     }
 
+    [HarmonyPatch(typeof(Unit_ChakramThrower), "Update")]
+    internal static class Patch_ChakramThrower_Update
+    {
+        private static void Postfix(Unit_ChakramThrower __instance)
+        {
+            if (NetworkServer.active) return;
+            try { ClientSide.OnChakramThrowerUpdate(__instance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/client] chakram tracking failed: " + e); }
+        }
+    }
+
     // host: which bullet is moving right now and whether its Move had tile contact - tells a DestroySelf
     // issued from Bullet.Update's tile loop apart from a lifetime / arrival destroy (see ServerSide.TryParkBulletDestroy)
     [HarmonyPatch(typeof(BulletMoveModule), "Move")]

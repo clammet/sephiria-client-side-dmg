@@ -80,6 +80,62 @@ namespace ClientSideDamage
                 && Time.time - _laserSeenAt < 1f;
         }
 
+        // ------------------------------------------------------------------ chakram thrower (Unit_ChakramThrower)
+        //
+        // Same situation as the laser: the chakrams are local GameObjects every peer instantiates and
+        // moves for itself from a synced start time (NetworkTime), the host tests its own copies and
+        // the circle it asks about cannot be anchored. Answer from our own copies.
+        private static float _chakramTouchedAt = -100f;
+        private static float _chakramSeenAt = -100f;
+        private static float _chakramRadius;
+
+        public static void OnChakramThrowerUpdate(Unit_ChakramThrower u)
+        {
+            if (u == null || !Active || !Has(CsdFeatures.AreaHits) || !Plugin.ClientAreaHitVerification.Value) return;
+            if (!u.isClient || u.isServer || !u.isChakramThrowing) return;
+            List<GameObject> chakrams = R.ChakramList(u);
+            if (chakrams == null || chakrams.Count == 0) return;
+            PlayerAvatar me = LocalAvatar;
+            if (me == null || me.IsDead) return;
+            _chakramSeenAt = Time.time;
+            _chakramRadius = u.charkramAttackRadius;
+            Collider2D[] mine = MyHitboxes(me);
+            AreaShape shape = new AreaShape();
+            shape.kind = AreaShapeKind.Circle;
+            shape.victim = AreaVictimTest.HitboxCollider;
+            shape.radius = u.charkramAttackRadius;
+            shape.useTriggers = true;
+            shape.useLayerMask = true;
+            shape.layerMask = CombatManager.Topdown1FLayerMask;
+            for (int i = 0; i < chakrams.Count; i++)
+            {
+                if (chakrams[i] == null) continue;
+                shape.center = chakrams[i].transform.position;
+                if (AreaGeom.HitboxOverlaps(shape, mine)) { _chakramTouchedAt = Time.time; return; }
+            }
+        }
+
+        private static bool IsChakramQuery(AreaShape s)
+        {
+            return s != null && s.kind == AreaShapeKind.Circle && !s.hasAnchor
+                && Mathf.Abs(s.radius - _chakramRadius) < 0.01f && Time.time - _chakramSeenAt < 1f;
+        }
+
+        /// <summary>
+        /// Hazards we simulate ourselves (core laser, chakrams): a touch of our copy within the
+        /// window confirms the host's hit; otherwise the query waits up to the hold for our copy to
+        /// arrive. Returns false while the query is still waiting.
+        /// </summary>
+        private static bool AnswerLocalHazard(PendingQuery q, string what, float touchedAt, out bool hit, out string detail)
+        {
+            float since = Time.time - touchedAt;
+            if (since <= LaserTouchWindow) { hit = true; detail = what + " touched us " + since.ToString("0.00") + "s ago"; }
+            else if (Time.time - q.arrivedAt < LaserQueryHold) { hit = false; detail = null; return false; }
+            else { hit = false; detail = what + " not touching us within " + LaserQueryHold + "s"; }
+            if (Plugin.DebugOn) detail = q.shape + " " + detail;
+            return true;
+        }
+
         public static bool Active
         {
             get
@@ -137,6 +193,8 @@ namespace ClientSideDamage
             _queries.Clear();
             _laserTouchedAt = -100f;
             _laserSeenAt = -100f;
+            _chakramTouchedAt = -100f;
+            _chakramSeenAt = -100f;
             _myHitboxes = null;
             _myHitboxOwner = null;
         }
@@ -299,11 +357,11 @@ namespace ClientSideDamage
             string detail = "";
             if (q.shape != null && Plugin.ClientAreaHitVerification.Value && IsLaserQuery(q.shape))
             {
-                float since = Time.time - _laserTouchedAt;
-                if (since <= LaserTouchWindow) { hit = true; detail = "laser touched us " + since.ToString("0.00") + "s ago"; }
-                else if (Time.time - q.arrivedAt < LaserQueryHold) return false;   // our copy of the laser may still be on its way
-                else { hit = false; detail = "laser not touching us within " + LaserQueryHold + "s"; }
-                if (Plugin.DebugOn) detail = q.shape + " " + detail;
+                if (!AnswerLocalHazard(q, "laser", _laserTouchedAt, out hit, out detail)) return false;
+            }
+            else if (q.shape != null && Plugin.ClientAreaHitVerification.Value && IsChakramQuery(q.shape))
+            {
+                if (!AnswerLocalHazard(q, "chakram", _chakramTouchedAt, out hit, out detail)) return false;
             }
             else if (q.shape != null && Plugin.ClientAreaHitVerification.Value)
             {

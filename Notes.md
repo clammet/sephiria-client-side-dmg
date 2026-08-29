@@ -1,4 +1,9 @@
 Testing notes:
+- Since 1.4.8 the fanatic bear chakrams (`Unit_ChakramThrower`) are verified on a joined client the
+  same way as the core laser: against the client's own locally simulated chakrams, with the 0.35 s
+  touch window and 0.3 s hold. In the 1.4.6 session log the client rejected 4 of 9 chakram checks
+  while 1-2 u from the host's circle. Test: stand in the orbit of a throwing bear as a joined player
+  (one hit per chakram per 0.5 s as on the host) and stand just outside it (no hit).
 - Since 1.4.7 the Purification core laser (`LibraryChapter4Dorm_CoreLaser`) is verified on a joined
   client against the client's own copy of the laser instead of the host's box. The lasers are local
   objects on every peer driven by a synced group angle, so the client's copy sweeps one network delay
