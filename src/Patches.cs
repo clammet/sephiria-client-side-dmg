@@ -165,6 +165,19 @@ namespace ClientSideDamage
         }
     }
 
+    // Purification core lasers are local objects on every peer; the joined client answers the host's
+    // laser queries from its own copy (see ClientSide.OnCoreLaserUpdate)
+    [HarmonyPatch(typeof(LibraryChapter4Dorm_CoreLaser), "Update")]
+    internal static class Patch_CoreLaser_Update
+    {
+        private static void Postfix(LibraryChapter4Dorm_CoreLaser __instance)
+        {
+            if (NetworkServer.active) return;
+            try { ClientSide.OnCoreLaserUpdate(__instance); }
+            catch (Exception e) { Plugin.Log.LogError("[CSD/client] core laser tracking failed: " + e); }
+        }
+    }
+
     // host: which bullet is moving right now and whether its Move had tile contact - tells a DestroySelf
     // issued from Bullet.Update's tile loop apart from a lifetime / arrival destroy (see ServerSide.TryParkBulletDestroy)
     [HarmonyPatch(typeof(BulletMoveModule), "Move")]

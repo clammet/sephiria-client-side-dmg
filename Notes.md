@@ -1,4 +1,13 @@
 Testing notes:
+- Since 1.4.7 the Purification core laser (`LibraryChapter4Dorm_CoreLaser`) is verified on a joined
+  client against the client's own copy of the laser instead of the host's box. The lasers are local
+  objects on every peer driven by a synced group angle, so the client's copy sweeps one network delay
+  behind the host's and the host's box could not be anchored; at RTT ~220 ms the client answered
+  MISS to 12 of 20 laser queries while standing in the beam. Now the client remembers when its own
+  laser last touched its hitbox, answers HIT when that was within 0.35 s, and otherwise holds the
+  query up to 0.3 s for the laser to arrive on its screen before answering MISS. Test: stand in a
+  sweeping laser as a joined player (damage every 0.2 s as on the host), step through it once
+  (one hit), and stand next to it (no hit).
 - Since 1.4.6 the hostile-bullet test on a joined client pre-filters with a 2D AABB. Before, it
   used Bounds.Intersects on Collider2D.bounds, which compares z as well; bullets spawn at
   z = height, so every hostile bullet flying above the ground was skipped before the real distance

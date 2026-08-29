@@ -35,8 +35,50 @@ namespace ClientSideDamage
             public PlayerAvatar avatar;
             public uint requestId;
             public AreaShape shape;
+            public float arrivedAt;
         }
         private static readonly List<PendingQuery> _queries = new List<PendingQuery>();
+
+        // ------------------------------------------------------------------ Purification core laser (LibraryChapter4Dorm_CoreLaser)
+        //
+        // The lasers are plain MonoBehaviours every peer instantiates for itself (RpcCreateLaser);
+        // only the group angle is synced (a 16-bit SyncVar), so our copy sweeps one network delay
+        // behind the host's. The host tests its box in its own Update and asks us; by the time the
+        // query is here the host's box is where the laser was, not where we see it, and the
+        // shape cannot be anchored (no NetworkIdentity above the laser). So we track our own
+        // copies every frame and answer a laser query from when our laser last touched us,
+        // holding the query briefly for a laser that is about to reach us on our screen.
+        private static float _laserTouchedAt = -100f;
+        private static float _laserSeenAt = -100f;
+        private const float LaserTouchWindow = 0.35f;   // a touch this recent confirms the host's hit
+        private const float LaserQueryHold = 0.3f;      // how long a laser query waits for our copy to arrive
+
+        public static void OnCoreLaserUpdate(LibraryChapter4Dorm_CoreLaser laser)
+        {
+            if (laser == null || !Active || !Has(CsdFeatures.AreaHits) || !Plugin.ClientAreaHitVerification.Value) return;
+            if (!laser.IsActive() || laser.damageCheckCollider == null) return;
+            PlayerAvatar me = LocalAvatar;
+            if (me == null || me.IsDead) return;
+            _laserSeenAt = Time.time;
+            AreaShape shape = new AreaShape();
+            shape.kind = AreaShapeKind.Box;
+            shape.victim = AreaVictimTest.HitboxCollider;
+            shape.center = laser.damageCheckCollider.transform.position;
+            shape.size = laser.damageCheckCollider.size;
+            shape.angle = laser.laserAngle;
+            shape.useTriggers = true;
+            shape.useLayerMask = true;
+            shape.layerMask = CombatManager.Topdown1FLayerMask;
+            if (AreaGeom.HitboxOverlaps(shape, MyHitboxes(me))) _laserTouchedAt = Time.time;
+        }
+
+        /// <summary>A thin, long, unanchored box while our own laser copies are running: the core laser's damage box.</summary>
+        private static bool IsLaserQuery(AreaShape s)
+        {
+            return s != null && s.kind == AreaShapeKind.Box && !s.hasAnchor
+                && Mathf.Min(s.size.x, s.size.y) <= 0.6f && Mathf.Max(s.size.x, s.size.y) >= 2f
+                && Time.time - _laserSeenAt < 1f;
+        }
 
         public static bool Active
         {
@@ -93,6 +135,8 @@ namespace ClientSideDamage
             _melees.Clear();
             _pentaxis.Clear();
             _queries.Clear();
+            _laserTouchedAt = -100f;
+            _laserSeenAt = -100f;
             _myHitboxes = null;
             _myHitboxOwner = null;
         }
@@ -231,7 +275,7 @@ namespace ClientSideDamage
             PlayerAvatar pa = avatar as PlayerAvatar;
             if (pa == null || !pa.isOwned) return;
             if (!NetworkClient.active || NetworkServer.active) return;
-            _queries.Add(new PendingQuery { avatar = pa, requestId = requestId, shape = shape });
+            _queries.Add(new PendingQuery { avatar = pa, requestId = requestId, shape = shape, arrivedAt = Time.time });
         }
 
         private static void AnswerQueries()
@@ -239,19 +283,29 @@ namespace ClientSideDamage
             for (int i = 0; i < _queries.Count; i++)
             {
                 PendingQuery q = _queries[i];
-                try { Answer(q); }
+                bool done = true;
+                try { done = Answer(q); }
                 catch (Exception e) { Plugin.Log.LogError("[CSD/client] damage query " + q.requestId + " failed: " + e); }
+                if (done) { _queries.RemoveAt(i); i--; }
             }
-            _queries.Clear();
         }
 
-        private static void Answer(PendingQuery q)
+        /// <summary>Returns false when the query is kept for a later frame.</summary>
+        private static bool Answer(PendingQuery q)
         {
             PlayerAvatar pa = q.avatar;
-            if (pa == null) return;
+            if (pa == null) return true;
             bool hit = true;
             string detail = "";
-            if (q.shape != null && Plugin.ClientAreaHitVerification.Value)
+            if (q.shape != null && Plugin.ClientAreaHitVerification.Value && IsLaserQuery(q.shape))
+            {
+                float since = Time.time - _laserTouchedAt;
+                if (since <= LaserTouchWindow) { hit = true; detail = "laser touched us " + since.ToString("0.00") + "s ago"; }
+                else if (Time.time - q.arrivedAt < LaserQueryHold) return false;   // our copy of the laser may still be on its way
+                else { hit = false; detail = "laser not touching us within " + LaserQueryHold + "s"; }
+                if (Plugin.DebugOn) detail = q.shape + " " + detail;
+            }
+            else if (q.shape != null && Plugin.ClientAreaHitVerification.Value)
             {
                 try { hit = AreaVerifier.Evaluate(q.shape, pa, out detail); }
                 catch (Exception e)
@@ -264,6 +318,7 @@ namespace ClientSideDamage
             uint requestId = q.requestId;
             CsdRpc.SendToServer(pa, CsdRpc.DamageReply, w => { w.WriteUInt(requestId); w.WriteBool(hit); snap.Write(w); });
             if (Plugin.DebugOn) Plugin.Debug("[CSD/client] query " + requestId + " -> " + (q.shape != null ? (hit ? "HIT " : "MISS ") + detail + " " : "") + snap);
+            return true;
         }
 
         // ------------------------------------------------------------------ local combat state
