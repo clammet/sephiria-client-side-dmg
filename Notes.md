@@ -1,4 +1,11 @@
 Testing notes:
+- Since 1.4.6 the hostile-bullet test on a joined client pre-filters with a 2D AABB. Before, it
+  used Bounds.Intersects on Collider2D.bounds, which compares z as well; bullets spawn at
+  z = height, so every hostile bullet flying above the ground was skipped before the real distance
+  test and a joined player was never hit by it (the host and the client's own bullets go through
+  Overlap, which ignores z). Test: cat assassin / thief knives and shuriken, mole rocks, archer
+  arrows against a joined player standing still and walking through the path; each visible contact
+  should damage once, near misses should stay misses.
 - Since 1.4.6 hostile attached swings whose prefab has no NetworkTransform follow the owner on the
   joined client (the same attach offset the host sends) instead of staying at the spawn point. In
   the assets that is exactly the Library DemonBook's `CMelee_LibraryDemonBook_Move` (3000 s life),

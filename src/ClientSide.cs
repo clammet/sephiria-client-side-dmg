@@ -622,12 +622,16 @@ namespace ClientSideDamage
                 // query we test the bullet's collider against our few hitbox colliders directly
                 Collider2D[] mine = MyHitboxes(me);
                 if (mine.Length == 0) return;
+                // Cheap AABB pre-test in 2D only: Collider2D.bounds carries the transform's z with
+                // zero extent, and Bounds.Intersects compares z too. Bullets spawn at z = height,
+                // so the 3D test never passed for a bullet flying above the ground and no hostile
+                // bullet was ever reported (vanilla's Overlap, and our own-bullet path, ignore z).
                 Bounds bb = b.attackingCollider.bounds;
                 ContactFilter2D f = R.BulletContactFilter(b);
                 for (int i = 0; i < mine.Length; i++)
                 {
                     Collider2D hb = mine[i];
-                    if (hb == null || !hb.enabled || !bb.Intersects(hb.bounds)) continue;
+                    if (hb == null || !hb.enabled || !Intersects2D(bb, hb.bounds)) continue;
                     if (f.IsFilteringLayerMask(hb.gameObject) || f.IsFilteringTrigger(hb) || f.IsFilteringDepth(hb.gameObject)) continue;
                     if (b.MoveModule != null && !b.MoveModule.ValidateCollision(hb)) continue;
                     ColliderDistance2D d = b.attackingCollider.Distance(hb);
@@ -647,6 +651,11 @@ namespace ClientSideDamage
                     track.phaseTimer = 0f;
                 }
             }
+        }
+
+        private static bool Intersects2D(Bounds a, Bounds b)
+        {
+            return a.min.x <= b.max.x && a.max.x >= b.min.x && a.min.y <= b.max.y && a.max.y >= b.min.y;
         }
 
         /// <summary>
