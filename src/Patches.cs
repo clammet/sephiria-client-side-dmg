@@ -301,20 +301,20 @@ namespace ClientSideDamage
             try
             {
                 DaggerGrowthBullet template = __instance.bulletPrefab != null ? __instance.bulletPrefab.GetComponent<DaggerGrowthBullet>() : null;
-                ServerSide.OnDaggerSpawn(__instance.NetworkAvatar, template, spawnPosition, direction, damage);
+                ServerSide.OnDaggerSpawn(__instance.NetworkAvatar, template, spawnPosition, direction, damage, __instance.damageId);
             }
             catch (Exception e) { Plugin.Log.LogError("[CSD/host] growth dagger spawn sync failed: " + e); }
         }
     }
 
-    [HarmonyPatch(typeof(DaggerGrowthBullet), "Initialize", new Type[] { typeof(UnitAvatar), typeof(Vector2), typeof(Vector2), typeof(float), typeof(bool) })]
+    [HarmonyPatch(typeof(DaggerGrowthBullet), "Initialize", new Type[] { typeof(UnitAvatar), typeof(Vector2), typeof(Vector2), typeof(float), typeof(bool), typeof(string) })]
     internal static class Patch_DaggerGrowthBullet_Initialize
     {
-        private static void Postfix(DaggerGrowthBullet __instance, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject)
+        private static void Postfix(DaggerGrowthBullet __instance, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject, string damageId)
         {
             try
             {
-                ServerSide.OnDaggerInitialized(__instance, owner, position, direction, damage, isServerObject);
+                ServerSide.OnDaggerInitialized(__instance, owner, position, direction, damage, isServerObject, damageId);
                 ClientSide.OnDaggerInitialized(__instance, owner, position, direction, damage, isServerObject);
             }
             catch (Exception e) { Plugin.Log.LogError("[CSD] growth dagger initialise tracking failed: " + e); }

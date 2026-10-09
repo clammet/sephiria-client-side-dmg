@@ -1,4 +1,14 @@
 Testing notes:
+- 1.4.9 fixes startup on Sephiria 1.0.33, which added a `damageId` argument to
+  `DaggerGrowthBullet.Initialize` and made the dagger's old `damageId` field private.
+  The mod now takes the damage ID from the charm and initialization argument so reported
+  dagger hits use the same ID as vanilla. Protocol 10 is unchanged.
+  Verified on 2026-10-08 against the installed game: clean Release build, all 56 required
+  patch targets and accessors resolved, normal Steam startup with Ready/On true and the
+  Harmony self-test passing. A temporary DLL with the old five-argument target reproduced
+  the failure and logged the expected/available signatures, versions, assembly details,
+  and exception. F9 confirmed Ready/On false, the specific failure in the host status,
+  and zero remaining patches. Co-op combat still needs a two-player check.
 - Since 1.4.8 the fanatic bear chakrams (`Unit_ChakramThrower`) are verified on a joined client the
   same way as the core laser: against the client's own locally simulated chakrams, with the 0.35 s
   touch window and 0.3 s hold. In the 1.4.6 session log the client rejected 4 of 9 chakram checks

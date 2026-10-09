@@ -20,6 +20,39 @@ namespace ClientSideDamage
         private static Type _keyboardType;
         private static PropertyInfo _keyboardCurrent, _f9Key, _wasPressed;
 
+        /// <summary>Always logged on startup failure, including when General.DebugLog is off.</summary>
+        public static void ReportInitFailure(string stage, Type patchType)
+        {
+            Plugin.Log.LogError("[CSD/init] failed at " + stage + "; CSD " + Plugin.VERSION
+                + " protocol " + Plugin.PROTOCOL_VERSION + "; game " + Application.version
+                + "; Unity " + Application.unityVersion + "; runtime " + Environment.Version
+                + "; OS " + SystemInfo.operatingSystem);
+            foreach (Assembly assembly in new[] { typeof(Plugin).Assembly, typeof(UnitAvatar).Assembly,
+                typeof(NetworkBehaviour).Assembly, typeof(Harmony).Assembly })
+            {
+                Plugin.Log.LogError("[CSD/init] " + assembly.FullName + "; MVID="
+                    + assembly.ManifestModule.ModuleVersionId + "; path=" + assembly.Location);
+            }
+            if (patchType == null) return;
+            foreach (HarmonyPatch patch in patchType.GetCustomAttributes(typeof(HarmonyPatch), true))
+            {
+                HarmonyMethod info = patch.info;
+                if (info.declaringType == null || info.methodName == null) continue;
+                string expected = info.declaringType.FullName + "." + info.methodName;
+                if (info.argumentTypes != null)
+                    expected += "(" + string.Join(", ", Array.ConvertAll(info.argumentTypes, t => t.FullName)) + ")";
+                Plugin.Log.LogError("[CSD/init] expected target: " + expected);
+                int found = 0;
+                foreach (MethodInfo method in info.declaringType.GetMethods(AccessTools.all))
+                {
+                    if (method.Name != info.methodName) continue;
+                    Plugin.Log.LogError("[CSD/init] available target: " + method.DeclaringType.FullName + "." + method);
+                    found++;
+                }
+                if (found == 0) Plugin.Log.LogError("[CSD/init] no methods named " + expected + " in the installed game");
+            }
+        }
+
         /// <summary>
         /// Patches a pure game function with a prefix, calls it, and reports whether the prefix ran.
         /// If it did not, no patch of this mod does anything at runtime, whatever PatchAll said.

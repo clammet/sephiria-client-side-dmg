@@ -179,7 +179,7 @@ namespace ClientSideDamage
         /// record therefore reaches each remote client before (or in the same reliable batch as)
         /// the visual spawn and supplies the id that vanilla's plain MonoBehaviour does not have.
         /// </summary>
-        public static void OnDaggerSpawn(UnitAvatar owner, DaggerGrowthBullet template, Vector2 position, Vector2 direction, float damage)
+        public static void OnDaggerSpawn(UnitAvatar owner, DaggerGrowthBullet template, Vector2 position, Vector2 direction, float damage, string damageId)
         {
             if (!NetworkServer.active || !Plugin.On || !Plugin.HostBulletHitAuthority.Value || owner == null) return;
             uint id;
@@ -193,7 +193,7 @@ namespace ClientSideDamage
                 spawnPosition = position,
                 direction = dir,
                 damage = damage,
-                damageId = template != null ? template.damageId : "DaggerGrowthBullet",
+                damageId = damageId,
                 hitRadius = template != null ? template.hitRadius : 0.5f,
                 maxTravel = DaggerMaxTravel(template),
                 expiresAt = Time.time + DaggerLifetime(template),
@@ -220,7 +220,7 @@ namespace ClientSideDamage
             if (Plugin.DebugOn) Plugin.Debug("[CSD/host] growth dagger spawn id " + id + " owner=" + owner.name + " -> " + sent + " client(s)");
         }
 
-        public static void OnDaggerInitialized(DaggerGrowthBullet projectile, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject)
+        public static void OnDaggerInitialized(DaggerGrowthBullet projectile, UnitAvatar owner, Vector2 position, Vector2 direction, float damage, bool isServerObject, string damageId)
         {
             if (projectile == null || !isServerObject || !NetworkServer.active) return;
             DaggerTrack match = null;
@@ -240,7 +240,7 @@ namespace ClientSideDamage
             }
             _pendingDaggers.Remove(match);
             match.projectile = projectile;
-            match.damageId = projectile.damageId;
+            match.damageId = damageId;
             match.hitRadius = projectile.hitRadius;
             match.maxTravel = DaggerMaxTravel(projectile);
             match.expiresAt = Mathf.Max(match.expiresAt, Time.time + DaggerLifetime(projectile));

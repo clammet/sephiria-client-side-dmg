@@ -1,7 +1,5 @@
 # Client Side Damage — Sephiria mod
 
-*Built by AI.*
-
 A BepInEx 5 plugin for **Sephiria** that makes the *joining* player's own game client the
 authority over its combat instead of the host:
 
@@ -47,7 +45,7 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
 3. Start the game. `BepInEx\LogOutput.log` should contain
 
    ```
-   [Info   :Client Side Damage] Client Side Damage 1.4.8 loaded (protocol 10)
+   [Info   :Client Side Damage] Client Side Damage 1.4.9 loaded (protocol 10)
    ```
 
 3. Play co-op. When a modded client joins a modded host, the logs show
@@ -58,13 +56,13 @@ You need **BepInEx 5 (x64)** and the plugin DLL. Do this on every PC that will p
    ```
 
    The joining player's own game also writes local `CSD : ...` lines into their chat log
-   (`v1.4.8 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
+   (`v1.4.9 loaded on your side, waiting for the host...`, then `host enabled: ...`, or
    `no answer from the host - it does not seem to run the mod`), so each side can tell from its
    own screen whether the mod is loaded there.
 
    The host also posts one-line status messages in the in-game chat log (sender `CSD`, sent
    through the game's own chat RPC, so un-modded players see them too): its own line when it
-   creates a multiplayer lobby (`CSD : v1.4.8 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
+   creates a multiplayer lobby (`CSD : v1.4.9 host ON: guard/dodge, bullets, melee, area, fresh-pos`)
    and, for every player joining the lobby, a line to everybody in the session as soon as their
    status is known (a modded client within a round trip, an un-modded one after ~2 s of silence) -
    `<player>: ON: guard/dodge, bullets, melee, area` with the negotiated features, or
@@ -332,11 +330,15 @@ Output: `dist\ClientSideDamage.dll`.
 
 ## Compatibility notes
 
-* Built against Sephiria build 8/21/2026 (Unity 6000.3.21, Mirror). Every game member the mod
+* Built against Sephiria 1.0.33 (Unity 6000.3.21f1, Mirror). Every game member the mod
   touches through accessors is resolved at start-up and every Harmony patch is applied inside
-  the same guarded step; if a game update renames something the plugin logs
-  `Failed to initialise (game version mismatch?)`, rolls back whatever patches were already
-  applied and stays dormant instead of half-working.
+  the same guarded step. If a game update changes a required member, the plugin rolls back
+  its patches and stays dormant. Chat names the failing step or patch and points to
+  `BepInEx\LogOutput.log`. The log includes the full exception, game/Unity/runtime versions,
+  assembly paths and build identifiers. For a failed patch with a declared target, it also
+  lists the expected method signature and the available overloads in the installed game.
+  These diagnostics are automatic, even with `General.DebugLog = false`. Include the full
+  log when reporting an initialization failure.
 * Mirror keeps only 16 bits of an RPC name hash and silently overwrites the registry on a
   clash. The mod checks its twelve hashes are free when it registers them and watches every later
   registration (the game's RPCs register lazily, per type); should a game RPC ever land on one of

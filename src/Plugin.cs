@@ -12,7 +12,7 @@ namespace ClientSideDamage
     {
         public const string GUID = "com.sephiria.clientsidedamage";
         public const string NAME = "Client Side Damage";
-        public const string VERSION = "1.4.8";
+        public const string VERSION = "1.4.9";
 
         // Bumped whenever the wire format of any RPC changes. Host and client must match.
         public const int PROTOCOL_VERSION = 10;
@@ -108,16 +108,29 @@ namespace ClientSideDamage
             // and the mod is Ready, or nothing stays behind (patches are rolled back) and the
             // mod is dormant - never half-patched.
             HarmonyInstance = new Harmony(GUID);
+            string initStage = "accessors";
+            Type patchType = null;
             try
             {
                 R.Init();
+                initStage = "RPC registration";
                 CsdRpc.Register();
-                HarmonyInstance.PatchAll(typeof(Plugin).Assembly);
+                initStage = "patch discovery";
+                foreach (Type type in typeof(Plugin).Assembly.GetTypes())
+                {
+                    if (!Attribute.IsDefined(type, typeof(HarmonyPatch))) continue;
+                    patchType = type;
+                    initStage = "patch " + type.Name;
+                    HarmonyInstance.CreateClassProcessor(type).Patch();
+                }
             }
             catch (Exception e)
             {
-                Log.LogError("Failed to initialise (game version mismatch?), mod disabled: " + e);
-                DisabledReason = "init failed (game update?)";
+                Ready = false;
+                DisabledReason = "init failed at " + initStage + "; see BepInEx/LogOutput.log";
+                Log.LogError("Failed to initialise at " + initStage + ", mod disabled: " + e);
+                try { Diagnostics.ReportInitFailure(initStage, patchType); }
+                catch (Exception de) { Log.LogError("Startup diagnostics failed: " + de); }
                 try { HarmonyInstance.UnpatchSelf(); } catch (Exception ue) { Log.LogError("Rollback of partial patches failed: " + ue); }
                 return;
             }
